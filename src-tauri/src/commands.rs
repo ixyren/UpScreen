@@ -264,7 +264,7 @@ pub fn show_or_recreate_dock(app: &AppHandle) {
         .visible(false)
         .build()
     {
-        position_dock_bottom_center(&win, 690.0, 76.0);
+        position_dock_bottom_center(&win, 504.0, 64.0);
         let _ = win.show();
         let _ = win.set_focus();
     }

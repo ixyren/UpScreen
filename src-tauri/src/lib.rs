@@ -57,7 +57,7 @@ pub fn run() {
         })
         .setup(|app| {
             if let Some(dock) = app.get_webview_window("dock") {
-                position_dock_bottom_center(&dock, 470.0, 64.0);
+                position_dock_bottom_center(&dock, 504.0, 64.0);
                 let _ = dock.show();
                 let _ = dock.set_focus();
             }

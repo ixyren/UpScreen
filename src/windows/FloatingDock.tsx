@@ -31,8 +31,8 @@ export default function FloatingDock() {
       })
       .catch(() => {});
 
-    // Keep dock compact and centered at bottom
-    invoke("resize_dock", { width: 470, height: 64 }).catch(() => {});
+    // Keep dock compact and centered at bottom with comfortable breathing room
+    invoke("resize_dock", { width: 504, height: 64 }).catch(() => {});
     // Disable auto-upscale before editor so all AI magic happens inside Editor
     invoke("sync_dock_settings", {
       autoUpscale: false,
@@ -76,7 +76,7 @@ export default function FloatingDock() {
         initial={{ opacity: 0, y: 12, scale: 0.96 }}
         animate={{ opacity: 1, y: 0, scale: 1 }}
         transition={{ type: "spring", stiffness: 420, damping: 32 }}
-        className="relative w-full rounded-2xl bg-[#090D16]/94 backdrop-blur-2xl border border-white/15 px-2.5 py-2 flex items-center gap-1.5"
+        className="relative w-full rounded-2xl bg-[#090D16]/94 backdrop-blur-2xl border border-white/15 px-3 py-2 flex items-center gap-1.5"
       >
         {/* Drag Handle + Brand Logo */}
         <div
