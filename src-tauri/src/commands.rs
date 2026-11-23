@@ -548,6 +548,7 @@ pub async fn confirm_overlay_capture(
     y: u32,
     width: u32,
     height: u32,
+    hwnd: Option<isize>,
 ) -> Result<(), String> {
     if let Some(overlay) = app.get_webview_window("overlay") {
         let _ = overlay.hide();
@@ -566,11 +567,17 @@ pub async fn confirm_overlay_capture(
         guard.windows.clear();
         guard.monitors.clear();
 
-        let cropped = match crop_image(&screen.image, x, y, width, height) {
-            Ok(c) => c,
-            Err(e) => {
-                guard.capture_in_progress = false;
-                return Err(e);
+        // When capturing a specific window, try transparent border-aware capture first
+        let transparent_win = hwnd.and_then(|h| crate::capture::capture_window_transparent(h).ok());
+        let cropped = if let Some(win_img) = transparent_win {
+            win_img
+        } else {
+            match crop_image(&screen.image, x, y, width, height) {
+                Ok(c) => c,
+                Err(e) => {
+                    guard.capture_in_progress = false;
+                    return Err(e);
+                }
             }
         };
         (
@@ -898,4 +905,59 @@ pub fn list_system_fonts() -> Vec<String> {
     }
 
     fonts.into_iter().collect()
+}
+
+fn resolve_config_file(filename: &str) -> std::path::PathBuf {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let candidate = dir.join(filename);
+            if candidate.exists() {
+                return candidate;
+            }
+            // Test writability of the executable root directory
+            let probe = dir.join(".upscreen_write_probe");
+            if std::fs::write(&probe, b"ok").is_ok() {
+                let _ = std::fs::remove_file(&probe);
+                return candidate;
+            }
+        }
+    }
+    let fallback_dir = directories::BaseDirs::new()
+        .map(|d| d.data_local_dir().join("UpScreen"))
+        .unwrap_or_else(|| std::env::temp_dir().join("UpScreen"));
+    let _ = std::fs::create_dir_all(&fallback_dir);
+    fallback_dir.join(filename)
+}
+
+#[tauri::command]
+pub fn load_png_presets() -> Result<String, String> {
+    let path = resolve_config_file("upscreen_png_presets.json");
+    if !path.exists() {
+        return Ok("[]".to_string());
+    }
+    std::fs::read_to_string(&path).map_err(|e| format!("Error leyendo presets PNG: {e}"))
+}
+
+#[tauri::command]
+pub fn save_png_presets(json: String) -> Result<String, String> {
+    let path = resolve_config_file("upscreen_png_presets.json");
+    std::fs::write(&path, json).map_err(|e| format!("Error guardando presets PNG: {e}"))?;
+    Ok(path.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+pub fn load_editor_settings() -> Result<Option<String>, String> {
+    let path = resolve_config_file("upscreen_editor_settings.json");
+    if !path.exists() {
+        return Ok(None);
+    }
+    let text = std::fs::read_to_string(&path)
+        .map_err(|e| format!("Error leyendo ajustes guardados: {e}"))?;
+    Ok(Some(text))
+}
+
+#[tauri::command]
+pub fn save_editor_settings(json: String) -> Result<(), String> {
+    let path = resolve_config_file("upscreen_editor_settings.json");
+    std::fs::write(&path, json).map_err(|e| format!("Error guardando ajustes: {e}"))
 }

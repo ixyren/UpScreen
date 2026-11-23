@@ -8,9 +8,10 @@ pub mod upscaler;
 use commands::{
     cancel_overlay_capture, confirm_overlay_capture, copy_edited_image,
     download_realesrgan_engine, get_editor_capture, get_overlay_session, get_system_status,
-    list_system_fonts, open_editor_window, position_dock_bottom_center, preview_upscale, quit_app,
-    resize_dock, save_edited_image, show_or_recreate_dock, show_ready_overlay, start_capture,
-    sync_dock_settings, trigger_capture_from_backend, AppState, RegisteredShortcuts,
+    list_system_fonts, load_editor_settings, load_png_presets, open_editor_window,
+    position_dock_bottom_center, preview_upscale, quit_app, resize_dock, save_edited_image,
+    save_editor_settings, save_png_presets, show_or_recreate_dock, show_ready_overlay,
+    start_capture, sync_dock_settings, trigger_capture_from_backend, AppState, RegisteredShortcuts,
 };
 use std::time::Duration;
 use tauri::{
@@ -56,7 +57,7 @@ pub fn run() {
         })
         .setup(|app| {
             if let Some(dock) = app.get_webview_window("dock") {
-                position_dock_bottom_center(&dock, 690.0, 76.0);
+                position_dock_bottom_center(&dock, 470.0, 64.0);
                 let _ = dock.show();
                 let _ = dock.set_focus();
             }
@@ -226,6 +227,10 @@ pub fn run() {
             open_editor_window,
             resize_dock,
             list_system_fonts,
+            load_png_presets,
+            save_png_presets,
+            load_editor_settings,
+            save_editor_settings,
         ])
         .run(tauri::generate_context!())
         .expect("error al ejecutar UpScreen");

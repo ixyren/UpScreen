@@ -20,11 +20,11 @@ export function useSmoothScroll(ref: RefObject<HTMLElement | null>) {
       const maxScroll = Math.max(0, el.scrollHeight - el.clientHeight);
       target = Math.max(0, Math.min(maxScroll, target));
 
-      const alpha = 1 - Math.exp(-14 * dt);
+      const alpha = 1 - Math.exp(-22 * dt);
       current += (target - current) * alpha;
       el.scrollTop = current;
 
-      if (Math.abs(target - current) > 0.35) {
+      if (Math.abs(target - current) > 0.25) {
         rafId = requestAnimationFrame(tick);
       } else {
         el.scrollTop = target;
@@ -53,6 +53,10 @@ export function useSmoothScroll(ref: RefObject<HTMLElement | null>) {
             : e.deltaY;
 
       target = Math.max(0, Math.min(maxScroll, target + delta));
+      // Kickstart immediately so there is zero perceived latency on the first wheel tick
+      current += (target - current) * 0.28;
+      el.scrollTop = current;
+
       if (rafId === null) {
         rafId = requestAnimationFrame(tick);
       }

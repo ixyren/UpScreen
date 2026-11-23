@@ -57,6 +57,7 @@ import type {
   DownloadProgressEvent,
   EditorCapturePayload,
   FrameOptions,
+  PngPreset,
   SaveResult,
   SystemStatus,
   TextBgStyle,
@@ -72,7 +73,110 @@ interface HistorySnapshot {
   height: number;
   annotations: Annotation[];
   activeCrop: CropRect | null;
+  frameOptions: FrameOptions;
+  upscaleBeforeSave: boolean;
+  scale: number;
+  model: UpscaleModel;
+  textProtection: AiQualityMode;
+  format: "png" | "webp" | "jpg" | "hevc-hw";
+  codecPreference: "auto" | "nvenc" | "amf" | "cpu";
 }
+
+const DEFAULT_FRAME_OPTIONS: FrameOptions = {
+  enabled: false,
+  borderRadius: 18,
+  padding: 44,
+  customPadding: false,
+  paddingTop: 44,
+  paddingRight: 44,
+  paddingBottom: 44,
+  paddingLeft: 44,
+  shadowStrength: "medium",
+  subtleBorder: true,
+  borderWidth: 1.5,
+  borderColor: "#FFFFFF",
+  borderOpacity: 0.24,
+  borderPosition: "inside",
+  shadowColor: "#000000",
+  shadowOffsetX: 0,
+  shadowOffsetY: 12,
+  shadowBlur: 24,
+  shadowSpread: 0,
+  shadowOpacity: 0.65,
+};
+
+const BUILTIN_PNG_PRESETS: PngPreset[] = [
+  {
+    id: "builtin-glass",
+    name: "Cristal Pro",
+    builtin: true,
+    frame: {
+      ...DEFAULT_FRAME_OPTIONS,
+      enabled: true,
+      borderRadius: 18,
+      padding: 44,
+      shadowStrength: "medium",
+      subtleBorder: true,
+      borderWidth: 1.5,
+      borderColor: "#FFFFFF",
+      borderOpacity: 0.24,
+      borderPosition: "inside",
+    },
+  },
+  {
+    id: "builtin-neon",
+    name: "Neón Cian",
+    builtin: true,
+    frame: {
+      ...DEFAULT_FRAME_OPTIONS,
+      enabled: true,
+      borderRadius: 20,
+      padding: 52,
+      shadowStrength: "custom",
+      shadowColor: "#22D3EE",
+      shadowOffsetX: 0,
+      shadowOffsetY: 10,
+      shadowBlur: 38,
+      shadowSpread: 0,
+      shadowOpacity: 0.45,
+      subtleBorder: true,
+      borderWidth: 2,
+      borderColor: "#22D3EE",
+      borderOpacity: 0.7,
+      borderPosition: "outside",
+    },
+  },
+  {
+    id: "builtin-elevated",
+    name: "Tarjeta Elevada",
+    builtin: true,
+    frame: {
+      ...DEFAULT_FRAME_OPTIONS,
+      enabled: true,
+      borderRadius: 24,
+      padding: 64,
+      shadowStrength: "strong",
+      subtleBorder: true,
+      borderWidth: 1,
+      borderColor: "#FFFFFF",
+      borderOpacity: 0.16,
+      borderPosition: "inside",
+    },
+  },
+  {
+    id: "builtin-clean",
+    name: "Borde Limpio",
+    builtin: true,
+    frame: {
+      ...DEFAULT_FRAME_OPTIONS,
+      enabled: true,
+      borderRadius: 14,
+      padding: 24,
+      shadowStrength: "soft",
+      subtleBorder: false,
+    },
+  },
+];
 
 const DEFAULT_TEXT_STYLE: TextStyleConfig = {
   fontFamily: "Segoe UI",
@@ -262,6 +366,13 @@ export default function EditorWindow() {
     "Impact",
   ]);
   const [fontFilter, setFontFilter] = useState<string>("");
+  const [hoveredFont, setHoveredFont] = useState<string | null>(null);
+  const [editingPadding, setEditingPadding] = useState<boolean>(false);
+  const [userPngPresets, setUserPngPresets] = useState<PngPreset[]>([]);
+  const [savingPresetMode, setSavingPresetMode] = useState<boolean>(false);
+  const [newPresetName, setNewPresetName] = useState<string>("");
+  const [settingsLoaded, setSettingsLoaded] = useState<boolean>(false);
+  const lastHistoryStampRef = useRef<number>(0);
 
   const [activeColor, setActiveColor] = useState<string>("#22D3EE");
   const [strokeWidth, setStrokeWidth] = useState<number>(4);
@@ -330,23 +441,7 @@ export default function EditorWindow() {
   const [model, setModel] = useState<UpscaleModel>("realesrgan-x4plus");
   const [textProtection, setTextProtection] =
     useState<AiQualityMode>("supersample");
-  const [frameOptions, setFrameOptions] = useState<FrameOptions>({
-    enabled: false,
-    borderRadius: 18,
-    padding: 44,
-    shadowStrength: "medium",
-    subtleBorder: true,
-    borderWidth: 1.5,
-    borderColor: "#FFFFFF",
-    borderOpacity: 0.24,
-    borderPosition: "inside",
-    shadowColor: "#000000",
-    shadowOffsetX: 0,
-    shadowOffsetY: 12,
-    shadowBlur: 24,
-    shadowSpread: 0,
-    shadowOpacity: 0.65,
-  });
+  const [frameOptions, setFrameOptions] = useState<FrameOptions>(DEFAULT_FRAME_OPTIONS);
   const [codecPreference, setCodecPreference] = useState<
     "auto" | "nvenc" | "amf" | "cpu"
   >("auto");
@@ -406,24 +501,75 @@ export default function EditorWindow() {
       setSelectedId(null);
       setCropRect(null);
       setActiveCrop(null);
+      setEditingPadding(false);
       setPreviewResult(null);
       setTool("select");
-      setScale(payload.appliedScale || 2);
-      setModel((payload.appliedModel as UpscaleModel) || "realesrgan-x4plus");
-      const rawMode = payload.appliedTextProtection as string | undefined;
-      setTextProtection(
-        rawMode === "tta" || rawMode === "balanced"
-          ? "tta"
-          : rawMode === "raw" || rawMode === "off"
-            ? "raw"
-            : "supersample"
-      );
-      // If capture was not already upscaled, default upscaleBeforeSave to false (user chooses in editor)
-      setUpscaleBeforeSave(false);
+      // Keep user's persisted right-panel settings intact across captures!
     } catch (err) {
       console.error("Error cargando captura en editor:", err);
     }
   }, []);
+
+  // Load saved PNG presets & persisted editor settings on startup
+  useEffect(() => {
+    invoke<string>("load_png_presets")
+      .then((raw) => {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) {
+          setUserPngPresets(parsed);
+        }
+      })
+      .catch(() => {});
+
+    invoke<string | null>("load_editor_settings")
+      .then((raw) => {
+        if (raw) {
+          const s = JSON.parse(raw);
+          if (typeof s.upscaleBeforeSave === "boolean") setUpscaleBeforeSave(s.upscaleBeforeSave);
+          if (typeof s.scale === "number") setScale(Math.max(2, Math.min(16, s.scale)));
+          if (typeof s.model === "string") setModel(s.model as UpscaleModel);
+          if (typeof s.textProtection === "string") setTextProtection(s.textProtection as AiQualityMode);
+          if (s.frameOptions && typeof s.frameOptions === "object") {
+            setFrameOptions({ ...DEFAULT_FRAME_OPTIONS, ...s.frameOptions });
+          }
+          if (typeof s.codecPreference === "string") setCodecPreference(s.codecPreference);
+          if (typeof s.format === "string") setFormat(s.format);
+        }
+      })
+      .catch(() => {})
+      .finally(() => setSettingsLoaded(true));
+  }, []);
+
+  // Auto-save right-panel settings whenever anything changes
+  useEffect(() => {
+    if (!settingsLoaded) return;
+    const timer = window.setTimeout(() => {
+      const payload = JSON.stringify(
+        {
+          upscaleBeforeSave,
+          scale,
+          model,
+          textProtection,
+          frameOptions,
+          codecPreference,
+          format,
+        },
+        null,
+        2
+      );
+      invoke("save_editor_settings", { json: payload }).catch(() => {});
+    }, 280);
+    return () => window.clearTimeout(timer);
+  }, [
+    settingsLoaded,
+    upscaleBeforeSave,
+    scale,
+    model,
+    textProtection,
+    frameOptions,
+    codecPreference,
+    format,
+  ]);
 
   useEffect(() => {
     loadSystemStatus();
@@ -450,69 +596,148 @@ export default function EditorWindow() {
     };
   }, [loadSystemStatus, loadEditorCapture]);
 
-  const pushHistory = useCallback(() => {
-    setPast((p) => [
-      ...p.slice(-24),
-      {
-        imageDataUrl,
-        width: imageWidth,
-        height: imageHeight,
-        annotations,
-        activeCrop,
-      },
-    ]);
-    setFuture([]);
-  }, [imageDataUrl, imageWidth, imageHeight, annotations, activeCrop]);
+  const currentSnapshot = useCallback(
+    (): HistorySnapshot => ({
+      imageDataUrl,
+      width: imageWidth,
+      height: imageHeight,
+      annotations,
+      activeCrop,
+      frameOptions,
+      upscaleBeforeSave,
+      scale,
+      model,
+      textProtection,
+      format,
+      codecPreference,
+    }),
+    [
+      imageDataUrl,
+      imageWidth,
+      imageHeight,
+      annotations,
+      activeCrop,
+      frameOptions,
+      upscaleBeforeSave,
+      scale,
+      model,
+      textProtection,
+      format,
+      codecPreference,
+    ]
+  );
+
+  const pushHistory = useCallback(
+    (debounced = false) => {
+      const now = Date.now();
+      if (debounced && now - lastHistoryStampRef.current < 420) {
+        return;
+      }
+      lastHistoryStampRef.current = now;
+      setPast((p) => [...p.slice(-34), currentSnapshot()]);
+      setFuture([]);
+    },
+    [currentSnapshot]
+  );
+
+  const applySnapshot = useCallback((snap: HistorySnapshot) => {
+    setImageDataUrl(snap.imageDataUrl);
+    setImageWidth(snap.width);
+    setImageHeight(snap.height);
+    setAnnotations(snap.annotations);
+    setActiveCrop(snap.activeCrop);
+    setFrameOptions(snap.frameOptions);
+    setUpscaleBeforeSave(snap.upscaleBeforeSave);
+    setScale(snap.scale);
+    setModel(snap.model);
+    setTextProtection(snap.textProtection);
+    setFormat(snap.format);
+    setCodecPreference(snap.codecPreference);
+    setSelectedId(null);
+    setPreviewResult(null);
+  }, []);
 
   const handleUndo = useCallback(() => {
     setPast((prevPast) => {
       if (prevPast.length === 0) return prevPast;
       const last = prevPast[prevPast.length - 1];
-      setFuture((f) => [
-        {
-          imageDataUrl,
-          width: imageWidth,
-          height: imageHeight,
-          annotations,
-          activeCrop,
-        },
-        ...f,
-      ]);
-      setImageDataUrl(last.imageDataUrl);
-      setImageWidth(last.width);
-      setImageHeight(last.height);
-      setAnnotations(last.annotations);
-      setActiveCrop(last.activeCrop);
-      setSelectedId(null);
-      setPreviewResult(null);
+      setFuture((f) => [currentSnapshot(), ...f]);
+      applySnapshot(last);
       return prevPast.slice(0, -1);
     });
-  }, [imageDataUrl, imageWidth, imageHeight, annotations, activeCrop]);
+  }, [currentSnapshot, applySnapshot]);
 
   const handleRedo = useCallback(() => {
     setFuture((prevFuture) => {
       if (prevFuture.length === 0) return prevFuture;
       const next = prevFuture[0];
-      setPast((p) => [
-        ...p,
-        {
-          imageDataUrl,
-          width: imageWidth,
-          height: imageHeight,
-          annotations,
-          activeCrop,
-        },
-      ]);
-      setImageDataUrl(next.imageDataUrl);
-      setImageWidth(next.width);
-      setImageHeight(next.height);
-      setAnnotations(next.annotations);
-      setActiveCrop(next.activeCrop);
-      setSelectedId(null);
-      setPreviewResult(null);
+      setPast((p) => [...p, currentSnapshot()]);
+      applySnapshot(next);
       return prevFuture.slice(1);
     });
-  }, [imageDataUrl, imageWidth, imageHeight, annotations, activeCrop]);
+  }, [currentSnapshot, applySnapshot]);
+
+  const updateFrameOptions = useCallback(
+    (patch: Partial<FrameOptions>, commit = true) => {
+      if (commit) pushHistory(true);
+      setFrameOptions((prev) => {
+        const next = { ...prev, ...patch };
+        if (patch.enabled) {
+          setFormat("png");
+        }
+        return next;
+      });
+    },
+    [pushHistory]
+  );
+
+  const handleSaveNewPngPreset = async () => {
+    const trimmed = newPresetName.trim();
+    if (!trimmed) return;
+    const preset: PngPreset = {
+      id: `user-${Date.now()}`,
+      name: trimmed,
+      frame: { ...frameOptions, enabled: true },
+    };
+    const nextList = [...userPngPresets, preset];
+    setUserPngPresets(nextList);
+    setNewPresetName("");
+    setSavingPresetMode(false);
+    try {
+      const savedPath = await invoke<string>("save_png_presets", {
+        json: JSON.stringify(nextList, null, 2),
+      });
+      showToast("success", `Preset "${trimmed}" guardado`, savedPath);
+    } catch (err) {
+      showToast("error", "Error guardando preset PNG", String(err));
+    }
+  };
+
+  const handleDeletePngPreset = async (id: string) => {
+    const nextList = userPngPresets.filter((p) => p.id !== id);
+    setUserPngPresets(nextList);
+    try {
+      await invoke<string>("save_png_presets", {
+        json: JSON.stringify(nextList, null, 2),
+      });
+    } catch {
+      // Ignore
+    }
+  };
+
+  const handleResetAllDefaults = () => {
+    pushHistory(false);
+    setUpscaleBeforeSave(false);
+    setScale(2);
+    setModel("realesrgan-x4plus");
+    setTextProtection("supersample");
+    setFrameOptions(DEFAULT_FRAME_OPTIONS);
+    setEditingPadding(false);
+    setCodecPreference("auto");
+    setFormat("png");
+    setPreviewResult(null);
+    showToast("success", "Ajustes restablecidos por defecto");
+  };
 
   const handleAddAnnotation = useCallback(
     (ann: Annotation) => {
@@ -1078,7 +1303,13 @@ export default function EditorWindow() {
       </header>
 
       {/* Top Contextual Formatting & Action Bar */}
-      <div className="h-12 shrink-0 bg-[#0C1220]/95 border-b border-white/10 px-3 flex items-center gap-2 overflow-x-auto">
+      <motion.div
+        key={`topbar-${captureMeta?.sessionId ?? 0}`}
+        initial={{ opacity: 0, y: -8 }}
+        animate={{ opacity: 1, y: 0 }}
+        transition={{ type: "spring", stiffness: 420, damping: 32 }}
+        className="h-12 shrink-0 bg-[#0C1220]/95 border-b border-white/10 px-3 flex items-center gap-2 overflow-x-auto"
+      >
         <div className="flex items-center gap-1">
           <button
             onClick={handleUndo}
@@ -1473,12 +1704,18 @@ export default function EditorWindow() {
             {upscaleBeforeSave ? `Guardar + ${scale}x AI` : "Guardar"}
           </span>
         </motion.button>
-      </div>
+      </motion.div>
 
       {/* Main Editor Body: Left Rail + Center Canvas + Right Inspector */}
       <div className="flex-1 min-h-0 flex">
         {/* Left Vertical Tool Rail */}
-        <aside className="w-14 shrink-0 bg-[#0A0F1B] border-r border-white/10 py-3 flex flex-col items-center gap-1.5">
+        <motion.aside
+          key={`rail-${captureMeta?.sessionId ?? 0}`}
+          initial={{ opacity: 0, x: -12 }}
+          animate={{ opacity: 1, x: 0 }}
+          transition={{ type: "spring", stiffness: 420, damping: 32 }}
+          className="w-14 shrink-0 bg-[#0A0F1B] border-r border-white/10 py-3 flex flex-col items-center gap-1.5"
+        >
           <ToolRailButton
             active={tool === "select"}
             icon={<MousePointer2 className="w-4 h-4" />}
@@ -1527,7 +1764,7 @@ export default function EditorWindow() {
               setTool("blur");
             }}
           />
-        </aside>
+        </motion.aside>
 
         {/* Center Interactive Stage + Floating Layers Modal */}
         <div className="relative flex-1 min-w-0 min-h-0 flex">
@@ -1552,13 +1789,16 @@ export default function EditorWindow() {
               aspectPreset={aspectPreset}
               previewResult={previewResult}
               frameOptions={frameOptions}
+              previewFontFamily={hoveredFont}
+              editingPadding={editingPadding}
               onSelectId={setSelectedId}
               onAddAnnotation={handleAddAnnotation}
               onUpdateAnnotation={handleUpdateAnnotation}
               onDeleteAnnotation={handleDeleteAnnotation}
               onChangeCropRect={setCropRect}
+              onChangeFrameOptions={updateFrameOptions}
               onChangeZoom={handleZoomChange}
-              onCheckpointHistory={pushHistory}
+              onCheckpointHistory={() => pushHistory(false)}
             />
           ) : (
             <div className="flex-1 checker-bg flex flex-col items-center justify-center text-center p-6 gap-3">
@@ -1645,12 +1885,19 @@ export default function EditorWindow() {
                       placeholder="Buscar fuente instalada..."
                       className="w-full rounded-lg bg-[#0F1624] border border-white/10 px-2.5 py-1.5 text-[11px] text-slate-100 placeholder:text-slate-500 outline-none focus:border-cyan-400/60"
                     />
-                    <div className="max-h-28 overflow-y-auto rounded-lg bg-[#0F1624] border border-white/10 p-1 space-y-0.5">
+                    <div
+                      onMouseLeave={() => setHoveredFont(null)}
+                      className="max-h-28 overflow-y-auto rounded-lg bg-[#0F1624] border border-white/10 p-1 space-y-0.5"
+                    >
                       {filteredSystemFonts.slice(0, 120).map((f) => (
                         <button
                           key={f}
                           onMouseDown={(e) => e.preventDefault()}
-                          onClick={() => updateTextStyle({ fontFamily: f })}
+                          onMouseEnter={() => setHoveredFont(f)}
+                          onClick={() => {
+                            setHoveredFont(null);
+                            updateTextStyle({ fontFamily: f });
+                          }}
                           style={{ fontFamily: `"${f}", sans-serif` }}
                           className={`w-full text-left px-2 py-1 rounded-md text-xs truncate cursor-pointer transition-colors ${
                             textStyle.fontFamily === f
@@ -2103,10 +2350,29 @@ export default function EditorWindow() {
         </div>
 
         {/* Right Inspector: Real-ESRGAN Upscaling & NVENC/AMF Hardware */}
-        <aside
+        <motion.aside
+          key={`inspector-${captureMeta?.sessionId ?? 0}`}
+          initial={{ opacity: 0, x: 14 }}
+          animate={{ opacity: 1, x: 0 }}
+          transition={{ type: "spring", stiffness: 420, damping: 32 }}
           ref={inspectorRef}
           className="w-80 shrink-0 bg-[#0A0F1B] border-l border-white/10 p-4 overflow-y-auto smooth-scroll space-y-4"
         >
+          {/* Inspector Header + Reset All Defaults */}
+          <div className="flex items-center justify-between">
+            <span className="text-[11px] font-semibold uppercase tracking-wider text-slate-400">
+              Ajustes (auto-guardados)
+            </span>
+            <button
+              onClick={handleResetAllDefaults}
+              className="flex items-center gap-1 px-2 py-1 rounded-lg bg-white/5 hover:bg-white/10 border border-white/10 text-[10px] font-medium text-slate-300 hover:text-white transition-colors cursor-pointer"
+              title="Restablecer todos los ajustes del panel a sus valores de fábrica"
+            >
+              <RotateCcw className="w-3 h-3" />
+              <span>Por defecto</span>
+            </button>
+          </div>
+
           {/* Card 1: Real-ESRGAN Upscaling */}
           <div className="rounded-2xl bg-white/[0.03] border border-white/10 p-3.5 space-y-3">
             <div className="flex items-center justify-between">
@@ -2376,16 +2642,72 @@ export default function EditorWindow() {
               )}
             </div>
 
+            {/* PNG Presets Bar (saved in upscreen_png_presets.json) */}
+            <div className="space-y-1.5 pb-1 border-b border-white/10">
+              <div className="flex items-center justify-between text-[10px]">
+                <span className="text-slate-400 font-medium">Presets PNG</span>
+                <button
+                  onClick={() => setSavingPresetMode((v) => !v)}
+                  className="px-1.5 py-0.5 rounded-md bg-indigo-500/15 hover:bg-indigo-500/25 border border-indigo-400/35 text-indigo-200 font-semibold cursor-pointer"
+                >
+                  {savingPresetMode ? "Cancelar" : "+ Guardar preset"}
+                </button>
+              </div>
+
+              {savingPresetMode && (
+                <div className="flex items-center gap-1">
+                  <input
+                    type="text"
+                    value={newPresetName}
+                    onChange={(e) => setNewPresetName(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") handleSaveNewPngPreset();
+                    }}
+                    placeholder="Nombre del preset..."
+                    className="flex-1 rounded-lg bg-[#0F1624] border border-indigo-400/40 px-2 py-1 text-[11px] text-slate-100 outline-none"
+                    autoFocus
+                  />
+                  <button
+                    onClick={handleSaveNewPngPreset}
+                    className="px-2 py-1 rounded-lg bg-indigo-400 text-slate-950 text-[11px] font-bold cursor-pointer"
+                  >
+                    OK
+                  </button>
+                </div>
+              )}
+
+              <div className="flex flex-wrap gap-1">
+                {[...BUILTIN_PNG_PRESETS, ...userPngPresets].map((preset) => (
+                  <div
+                    key={preset.id}
+                    className="group inline-flex items-center rounded-lg bg-white/[0.05] hover:bg-indigo-500/20 border border-white/10 hover:border-indigo-400/45 transition-colors"
+                  >
+                    <button
+                      onClick={() =>
+                        updateFrameOptions({ ...preset.frame, enabled: true }, true)
+                      }
+                      className="px-2 py-1 text-[10px] font-medium text-slate-200 cursor-pointer"
+                    >
+                      {preset.name}
+                    </button>
+                    {!preset.builtin && (
+                      <button
+                        onClick={() => handleDeletePngPreset(preset.id)}
+                        className="pr-1.5 text-slate-400 hover:text-rose-300 cursor-pointer"
+                        title="Eliminar preset"
+                      >
+                        <X className="w-2.5 h-2.5" />
+                      </button>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </div>
+
             <button
-              onClick={() => {
-                setFrameOptions((prev) => {
-                  const nextEnabled = !prev.enabled;
-                  if (nextEnabled) {
-                    setFormat("png");
-                  }
-                  return { ...prev, enabled: nextEnabled };
-                });
-              }}
+              onClick={() =>
+                updateFrameOptions({ enabled: !frameOptions.enabled }, true)
+              }
               className={`w-full flex items-center justify-between px-3 py-2.5 rounded-xl border text-left transition-all cursor-pointer ${
                 frameOptions.enabled
                   ? "bg-gradient-to-r from-indigo-500/20 to-cyan-500/20 border-indigo-400/50 text-indigo-100"
@@ -2623,12 +2945,39 @@ export default function EditorWindow() {
                   )}
                 </div>
 
-                <div className="space-y-1">
+                <div className="space-y-1.5">
                   <div className="flex items-center justify-between text-[11px]">
                     <span className="text-slate-400">Margen transparente</span>
-                    <span className="text-indigo-200 font-semibold">
-                      {frameOptions.padding} px
-                    </span>
+                    <div className="flex items-center gap-1.5">
+                      {frameOptions.customPadding && (
+                        <button
+                          onClick={() =>
+                            updateFrameOptions({
+                              customPadding: false,
+                              paddingTop: frameOptions.padding,
+                              paddingRight: frameOptions.padding,
+                              paddingBottom: frameOptions.padding,
+                              paddingLeft: frameOptions.padding,
+                            })
+                          }
+                          className="text-[10px] text-slate-400 hover:text-slate-200 cursor-pointer"
+                          title="Volver a margen uniforme"
+                        >
+                          Igualar
+                        </button>
+                      )}
+                      <button
+                        onClick={() => setEditingPadding((v) => !v)}
+                        className={`px-2 py-0.5 rounded-md text-[10px] font-semibold border transition-colors cursor-pointer ${
+                          editingPadding
+                            ? "bg-cyan-500/25 border-cyan-400/60 text-cyan-100"
+                            : "bg-white/5 border-white/10 text-cyan-200 hover:bg-white/10"
+                        }`}
+                        title="Activa 4 tiradores en el viewport para cuadrar el margen arrastrando"
+                      >
+                        {editingPadding ? "Listo" : "Personalizar"}
+                      </button>
+                    </div>
                   </div>
                   <input
                     type="range"
@@ -2636,14 +2985,27 @@ export default function EditorWindow() {
                     max={120}
                     step={4}
                     value={frameOptions.padding}
-                    onChange={(e) =>
-                      setFrameOptions((p) => ({
-                        ...p,
-                        padding: Number(e.target.value),
-                      }))
-                    }
+                    onChange={(e) => {
+                      const val = Number(e.target.value);
+                      updateFrameOptions({
+                        padding: val,
+                        customPadding: false,
+                        paddingTop: val,
+                        paddingRight: val,
+                        paddingBottom: val,
+                        paddingLeft: val,
+                      });
+                    }}
                     className="w-full accent-indigo-400 cursor-pointer"
                   />
+                  {frameOptions.customPadding && (
+                    <div className="text-[10px] text-cyan-200/90 flex justify-between px-0.5">
+                      <span>↑ {frameOptions.paddingTop ?? frameOptions.padding}px</span>
+                      <span>→ {frameOptions.paddingRight ?? frameOptions.padding}px</span>
+                      <span>↓ {frameOptions.paddingBottom ?? frameOptions.padding}px</span>
+                      <span>← {frameOptions.paddingLeft ?? frameOptions.padding}px</span>
+                    </div>
+                  )}
                 </div>
 
                 <label className="flex items-center justify-between text-[11px] text-slate-300 cursor-pointer pt-0.5">
@@ -2841,7 +3203,7 @@ export default function EditorWindow() {
               </div>
             )}
           </div>
-        </aside>
+        </motion.aside>
       </div>
 
       {/* Animated Toast Notification */}

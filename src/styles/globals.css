@@ -29,7 +29,7 @@
 }
 
 .smooth-scroll {
-  scroll-behavior: smooth;
+  scroll-behavior: auto;
   overscroll-behavior: contain;
 }
 

@@ -79,6 +79,14 @@ pub struct FrameOptions {
     pub border_radius: f32,
     #[serde(default = "default_padding")]
     pub padding: u32,
+    #[serde(default)]
+    pub padding_top: Option<u32>,
+    #[serde(default)]
+    pub padding_right: Option<u32>,
+    #[serde(default)]
+    pub padding_bottom: Option<u32>,
+    #[serde(default)]
+    pub padding_left: Option<u32>,
     #[serde(default = "default_shadow_strength")]
     pub shadow_strength: String,
     #[serde(default = "default_subtle_border")]
@@ -111,6 +119,10 @@ impl Default for FrameOptions {
             enabled: false,
             border_radius: 18.0,
             padding: 44,
+            padding_top: None,
+            padding_right: None,
+            padding_bottom: None,
+            padding_left: None,
             shadow_strength: "medium".to_string(),
             subtle_border: true,
             border_width: 1.5,
@@ -202,7 +214,6 @@ pub fn apply_rounded_shadow_frame(
     }
 
     let sf = scale_factor.clamp(1.0, 16.0);
-    let max_dim = w.max(h);
     let (base_alpha, base_blur, base_offset_x, base_offset_y, base_spread) =
         match opts.shadow_strength.as_str() {
             "none" => (0.0f32, 0.0f32, 0.0f32, 0.0f32, 0.0f32),
@@ -241,39 +252,67 @@ pub fn apply_rounded_shadow_frame(
         0.0
     };
     let min_pad = shadow_pad.max((border_outer_extent + 2.0).ceil());
-    let mut pad = ((opts.padding as f32) * sf).round().max(min_pad) as u32;
+    let has_custom_pads = opts.padding_top.is_some()
+        || opts.padding_right.is_some()
+        || opts.padding_bottom.is_some()
+        || opts.padding_left.is_some();
+
+    let mut pad_t = ((opts.padding_top.unwrap_or(opts.padding) as f32) * sf).round() as u32;
+    let mut pad_r = ((opts.padding_right.unwrap_or(opts.padding) as f32) * sf).round() as u32;
+    let mut pad_b = ((opts.padding_bottom.unwrap_or(opts.padding) as f32) * sf).round() as u32;
+    let mut pad_l = ((opts.padding_left.unwrap_or(opts.padding) as f32) * sf).round() as u32;
+
+    if !has_custom_pads {
+        let uniform = (min_pad as u32).max(pad_t);
+        pad_t = uniform;
+        pad_r = uniform;
+        pad_b = uniform;
+        pad_l = uniform;
+    } else {
+        let min_border_pad = (border_outer_extent + 2.0).ceil() as u32;
+        pad_t = pad_t.max(min_border_pad);
+        pad_r = pad_r.max(min_border_pad);
+        pad_b = pad_b.max(min_border_pad);
+        pad_l = pad_l.max(min_border_pad);
+    }
 
     // Keep final dimensions safely within 16384 px
-    if max_dim + pad.saturating_mul(2) > 16384 {
-        let avail_pad = (16384u32.saturating_sub(max_dim)) / 2;
-        if avail_pad < 4 {
+    if w + pad_l + pad_r > 16384 || h + pad_t + pad_b > 16384 {
+        let avail_x = 16384u32.saturating_sub(w) / 2;
+        let avail_y = 16384u32.saturating_sub(h) / 2;
+        if avail_x < 4 || avail_y < 4 {
             return img.clone();
         }
-        let ratio = avail_pad as f32 / (pad.max(1) as f32);
-        pad = avail_pad;
+        pad_l = pad_l.min(avail_x);
+        pad_r = pad_r.min(avail_x);
+        pad_t = pad_t.min(avail_y);
+        pad_b = pad_b.min(avail_y);
+        let max_p = pad_l.max(pad_r).max(pad_t).max(pad_b).max(1) as f32;
+        let ratio = (max_p / (min_pad.max(1.0))).min(1.0);
         blur_r *= ratio;
         offset_x *= ratio;
         offset_y *= ratio;
         spread *= ratio;
     }
 
-    let out_w = w + pad * 2;
-    let out_h = h + pad * 2;
+    let out_w = w + pad_l + pad_r;
+    let out_h = h + pad_t + pad_b;
     let out_wu = out_w as usize;
     let out_hu = out_h as usize;
 
     let wf = w as f32;
     let hf = h as f32;
-    let pad_f = pad as f32;
+    let pad_lf = pad_l as f32;
+    let pad_tf = pad_t as f32;
     let rad = (opts.border_radius.max(0.0) * sf).min(wf.min(hf) * 0.45);
 
-    // 1. Build shadow mask shifted by (pad + offset_x, pad + offset_y) with optional spread
+    // 1. Build shadow mask shifted by (pad_l + offset_x, pad_t + offset_y) with optional spread
     let mut shadow = vec![0.0f32; out_wu * out_hu];
     if base_alpha > 0.001 {
         let sw = (wf + spread * 2.0).max(2.0);
         let sh = (hf + spread * 2.0).max(2.0);
-        let s_left = pad_f + offset_x - spread;
-        let s_top = pad_f + offset_y - spread;
+        let s_left = pad_lf + offset_x - spread;
+        let s_top = pad_tf + offset_y - spread;
         let s_rad = (rad + spread.max(0.0)).min(sw.min(sh) * 0.45);
 
         let x_min = (s_left - 2.0).floor().max(0.0) as usize;
@@ -308,28 +347,28 @@ pub fn apply_rounded_shadow_frame(
         _ => (-bw, 0.0f32),
     };
     let ext_px = (border_outer_extent + 2.0).ceil() as usize;
-    let bx_min = (pad as usize).saturating_sub(ext_px);
-    let bx_max = ((pad + w) as usize + ext_px).min(out_wu);
-    let by_min = (pad as usize).saturating_sub(ext_px);
-    let by_max = ((pad + h) as usize + ext_px).min(out_hu);
+    let bx_min = (pad_l as usize).saturating_sub(ext_px);
+    let bx_max = ((pad_l + w) as usize + ext_px).min(out_wu);
+    let by_min = (pad_t as usize).saturating_sub(ext_px);
+    let by_max = ((pad_t + h) as usize + ext_px).min(out_hu);
 
     for y in 0..out_hu {
         let row = y * out_wu;
         let py = y as f32 + 0.5;
-        let in_y = y >= pad as usize && y < (pad + h) as usize;
+        let in_y = y >= pad_t as usize && y < (pad_t + h) as usize;
         let in_border_y = y >= by_min && y < by_max;
 
         for x in 0..out_wu {
             let bg_a = shadow[row + x].clamp(0.0, 1.0);
-            let in_img = in_y && x >= pad as usize && x < (pad + w) as usize;
+            let in_img = in_y && x >= pad_l as usize && x < (pad_l + w) as usize;
             let in_border_box = draw_border && in_border_y && x >= bx_min && x < bx_max;
 
             if in_img || in_border_box {
                 let px = x as f32 + 0.5;
-                let sdf = sd_rounded_rect(px, py, pad_f, pad_f, wf, hf, rad);
+                let sdf = sd_rounded_rect(px, py, pad_lf, pad_tf, wf, hf, rad);
 
                 let (src_r, src_g, src_b, fg_a, src_a_norm) = if in_img {
-                    let src_px = img.get_pixel((x as u32) - pad, (y as u32) - pad);
+                    let src_px = img.get_pixel((x as u32) - pad_l, (y as u32) - pad_t);
                     let cov = (0.5 - sdf).clamp(0.0, 1.0);
                     let a_norm = (src_px[3] as f32) / 255.0;
                     (
@@ -396,6 +435,10 @@ mod tests {
             enabled: true,
             border_radius: 18.0,
             padding: 44,
+            padding_top: None,
+            padding_right: None,
+            padding_bottom: None,
+            padding_left: None,
             shadow_strength: "medium".to_string(),
             subtle_border: true,
             ..FrameOptions::default()

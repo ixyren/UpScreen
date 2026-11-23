@@ -70,6 +70,11 @@ export interface FrameOptions {
   enabled: boolean;
   borderRadius: number;
   padding: number;
+  customPadding?: boolean;
+  paddingTop?: number;
+  paddingRight?: number;
+  paddingBottom?: number;
+  paddingLeft?: number;
   shadowStrength: "none" | "soft" | "medium" | "strong" | "custom";
   subtleBorder: boolean;
   borderWidth: number;
@@ -82,6 +87,13 @@ export interface FrameOptions {
   shadowBlur: number;
   shadowSpread: number;
   shadowOpacity: number;
+}
+
+export interface PngPreset {
+  id: string;
+  name: string;
+  builtin?: boolean;
+  frame: FrameOptions;
 }
 
 export interface EditorCapturePayload {

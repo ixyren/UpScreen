@@ -111,7 +111,13 @@ export default function CaptureOverlay() {
   }, [session]);
 
   const confirmRect = useCallback(
-    async (x: number, y: number, width: number, height: number) => {
+    async (
+      x: number,
+      y: number,
+      width: number,
+      height: number,
+      hwnd?: number
+    ) => {
       if (submitting || width < 6 || height < 6) return;
       setSubmitting(true);
       playCaptureShutter();
@@ -129,7 +135,13 @@ export default function CaptureOverlay() {
       setSession(null);
 
       try {
-        await invoke("confirm_overlay_capture", { x, y, width, height });
+        await invoke("confirm_overlay_capture", {
+          x,
+          y,
+          width,
+          height,
+          hwnd: hwnd ?? null,
+        });
       } catch (err) {
         console.error("Error confirmando captura:", err);
         setSubmitting(false);
@@ -249,7 +261,8 @@ export default function CaptureOverlay() {
         Math.max(0, hoveredWin.x),
         Math.max(0, hoveredWin.y),
         hoveredWin.width,
-        hoveredWin.height
+        hoveredWin.height,
+        hoveredWin.hwnd
       );
     } else if (mode === "monitor" && hoveredMonitor) {
       confirmRect(

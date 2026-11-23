@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { AnimatePresence, motion } from "framer-motion";
 import { Maximize, Trash2, ZoomIn, ZoomOut } from "lucide-react";
 import type {
   Annotation,
@@ -34,6 +35,8 @@ interface EditorCanvasProps {
   aspectPreset: AspectPreset;
   previewResult: UpscalePreviewResult | null;
   frameOptions?: FrameOptions;
+  previewFontFamily?: string | null;
+  editingPadding?: boolean;
   onSelectId: (id: string | null) => void;
   onAddAnnotation: (ann: Annotation) => void;
   onUpdateAnnotation: (
@@ -43,6 +46,7 @@ interface EditorCanvasProps {
   ) => void;
   onDeleteAnnotation: (id: string) => void;
   onChangeCropRect: (rect: CropRect | null) => void;
+  onChangeFrameOptions?: (patch: Partial<FrameOptions>, commit?: boolean) => void;
   onChangeZoom: (next: number | "fit") => void;
   onCheckpointHistory?: () => void;
 }
@@ -479,11 +483,14 @@ export default function EditorCanvas({
   aspectPreset,
   previewResult,
   frameOptions,
+  previewFontFamily = null,
+  editingPadding = false,
   onSelectId,
   onAddAnnotation,
   onUpdateAnnotation,
   onDeleteAnnotation,
   onChangeCropRect,
+  onChangeFrameOptions,
   onChangeZoom,
   onCheckpointHistory,
 }: EditorCanvasProps) {
@@ -524,12 +531,17 @@ export default function EditorCanvas({
       | "resize-ann"
       | "draw-crop"
       | "move-crop"
-      | "resize-crop";
+      | "resize-crop"
+      | "resize-pad";
     startImgX: number;
     startImgY: number;
+    startClientX?: number;
+    startClientY?: number;
     targetId?: string;
     origAnn?: Annotation;
+    origBounds?: { x: number; y: number; w: number; h: number };
     origCrop?: CropRect;
+    origPads?: { top: number; right: number; bottom: number; left: number };
     handle?: HandleDir;
     checkpointed?: boolean;
     pointerId?: number;
@@ -546,23 +558,39 @@ export default function EditorCanvas({
     ? Math.max(1, Math.min(imageHeight - viewOffsetY, Math.round(viewCrop.height)))
     : imageHeight;
 
+  const padTopVal = frameOptions?.customPadding
+    ? (frameOptions.paddingTop ?? frameOptions.padding ?? 44)
+    : (frameOptions?.padding ?? 44);
+  const padRightVal = frameOptions?.customPadding
+    ? (frameOptions.paddingRight ?? frameOptions.padding ?? 44)
+    : (frameOptions?.padding ?? 44);
+  const padBottomVal = frameOptions?.customPadding
+    ? (frameOptions.paddingBottom ?? frameOptions.padding ?? 44)
+    : (frameOptions?.padding ?? 44);
+  const padLeftVal = frameOptions?.customPadding
+    ? (frameOptions.paddingLeft ?? frameOptions.padding ?? 44)
+    : (frameOptions?.padding ?? 44);
+
   const computeFitCamera = useCallback(
     (w: number, h: number): CameraState => {
-      const pad = showLiveFrame ? (frameOptions?.padding ?? 44) * 2 : 0;
+      const padX = showLiveFrame ? padLeftVal + padRightVal : 0;
+      const padY = showLiveFrame ? padTopVal + padBottomVal : 0;
       const availW = Math.max(80, w - 48);
       const availH = Math.max(80, h - 48);
       const fitScale = Math.min(
         1,
-        availW / Math.max(1, viewWidth + pad),
-        availH / Math.max(1, viewHeight + pad)
+        availW / Math.max(1, viewWidth + padX),
+        availH / Math.max(1, viewHeight + padY)
       );
+      const totalW = (viewWidth + padX) * fitScale;
+      const totalH = (viewHeight + padY) * fitScale;
       return {
         scale: fitScale,
-        x: (w - viewWidth * fitScale) * 0.5,
-        y: (h - viewHeight * fitScale) * 0.5,
+        x: (w - totalW) * 0.5 + (showLiveFrame ? padLeftVal * fitScale : 0),
+        y: (h - totalH) * 0.5 + (showLiveFrame ? padTopVal * fitScale : 0),
       };
     },
-    [viewWidth, viewHeight, showLiveFrame, frameOptions?.padding]
+    [viewWidth, viewHeight, showLiveFrame, padLeftVal, padRightVal, padTopVal, padBottomVal]
   );
 
   const clampCamera = useCallback(
@@ -827,11 +855,13 @@ export default function EditorCanvas({
     ctx.save();
     ctx.translate(-viewOffsetX, -viewOffsetY);
     ctx.drawImage(img, 0, 0);
-    const visibleAnns = editingTextId
-      ? annotations.filter((a) => a.id !== editingTextId)
-      : annotations;
-    const list = draftAnn ? [...visibleAnns, draftAnn] : visibleAnns;
-    drawAnnotationsOnCanvas(ctx, img, list);
+    // In interactive edit mode, text/rect/arrow render as crisp animated vector overlays above canvas;
+    // canvas only renders base image + blurs (in comparison preview mode, render all layers on left side).
+    const allList = draftAnn ? [...annotations, draftAnn] : annotations;
+    const canvasList = previewResult
+      ? allList
+      : allList.filter((a) => a.kind === "blur");
+    drawAnnotationsOnCanvas(ctx, img, canvasList);
     ctx.restore();
   }, [
     imageDataUrl,
@@ -943,12 +973,15 @@ export default function EditorCanvas({
       e.preventDefault();
       e.stopPropagation();
       const pt = clientToImg(e.clientX, e.clientY);
+      const ctx = canvasRef.current?.getContext("2d") ?? null;
+      const origBounds = getAnnotationBounds(ann, ctx);
       interactionRef.current = {
         kind: "resize-ann",
         startImgX: pt.x,
         startImgY: pt.y,
         targetId: ann.id,
         origAnn: { ...ann },
+        origBounds,
         handle,
         pointerId: e.pointerId,
       };
@@ -959,6 +992,34 @@ export default function EditorCanvas({
       }
     },
     [clientToImg]
+  );
+
+  const startPaddingHandleDrag = useCallback(
+    (handle: HandleDir, e: React.PointerEvent) => {
+      e.preventDefault();
+      e.stopPropagation();
+      interactionRef.current = {
+        kind: "resize-pad",
+        startImgX: 0,
+        startImgY: 0,
+        startClientX: e.clientX,
+        startClientY: e.clientY,
+        origPads: {
+          top: padTopVal,
+          right: padRightVal,
+          bottom: padBottomVal,
+          left: padLeftVal,
+        },
+        handle,
+        pointerId: e.pointerId,
+      };
+      try {
+        viewportRef.current?.setPointerCapture(e.pointerId);
+      } catch {
+        // Ignore
+      }
+    },
+    [padTopVal, padRightVal, padBottomVal, padLeftVal]
   );
 
   const handleViewportPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
@@ -1307,6 +1368,43 @@ export default function EditorCanvas({
       return;
     }
 
+    if (inter.kind === "resize-pad" && inter.origPads && inter.handle) {
+      if (!inter.checkpointed) {
+        onCheckpointHistory?.();
+        inter.checkpointed = true;
+      }
+      const scaleInv = 1 / Math.max(0.05, curCamRef.current.scale);
+      const dx = (e.clientX - (inter.startClientX ?? e.clientX)) * scaleInv;
+      const dy = (e.clientY - (inter.startClientY ?? e.clientY)) * scaleInv;
+      const o = inter.origPads;
+      const h = inter.handle;
+
+      const nextTop = h.includes("n")
+        ? Math.max(0, Math.min(240, Math.round(o.top - dy)))
+        : o.top;
+      const nextBottom = h.includes("s")
+        ? Math.max(0, Math.min(240, Math.round(o.bottom + dy)))
+        : o.bottom;
+      const nextLeft = h.includes("w")
+        ? Math.max(0, Math.min(240, Math.round(o.left - dx)))
+        : o.left;
+      const nextRight = h.includes("e")
+        ? Math.max(0, Math.min(240, Math.round(o.right + dx)))
+        : o.right;
+
+      onChangeFrameOptions?.(
+        {
+          customPadding: true,
+          paddingTop: nextTop,
+          paddingRight: nextRight,
+          paddingBottom: nextBottom,
+          paddingLeft: nextLeft,
+        },
+        false
+      );
+      return;
+    }
+
     if (inter.kind === "resize-ann" && inter.targetId && inter.origAnn && inter.handle) {
       if (!inter.checkpointed) {
         onCheckpointHistory?.();
@@ -1321,6 +1419,22 @@ export default function EditorCanvas({
         } else {
           onUpdateAnnotation(inter.targetId, { x2: pt.x, y2: pt.y }, false);
         }
+        return;
+      }
+
+      if (orig.kind === "text" && inter.origBounds) {
+        const b = inter.origBounds;
+        const cx = b.x + b.w * 0.5;
+        const cy = b.y + b.h * 0.5;
+        const startDist = Math.max(12, Math.hypot(inter.startImgX - cx, inter.startImgY - cy));
+        const curDist = Math.max(8, Math.hypot(pt.x - cx, pt.y - cy));
+        const ratio = curDist / startDist;
+        const nextSize = Math.max(10, Math.min(240, Math.round(orig.fontSize * ratio)));
+        onUpdateAnnotation(
+          inter.targetId,
+          { fontSize: nextSize },
+          false
+        );
         return;
       }
 
@@ -1466,9 +1580,10 @@ export default function EditorCanvas({
   const displayW = Math.max(1, Math.round(viewWidth * displayScale));
   const displayH = Math.max(1, Math.round(viewHeight * displayScale));
 
-  const framePadPx = showLiveFrame
-    ? Math.max(0, Math.round((frameOptions?.padding ?? 44) * displayScale))
-    : 0;
+  const padTopPx = showLiveFrame ? Math.max(0, Math.round(padTopVal * displayScale)) : 0;
+  const padRightPx = showLiveFrame ? Math.max(0, Math.round(padRightVal * displayScale)) : 0;
+  const padBottomPx = showLiveFrame ? Math.max(0, Math.round(padBottomVal * displayScale)) : 0;
+  const padLeftPx = showLiveFrame ? Math.max(0, Math.round(padLeftVal * displayScale)) : 0;
   const frameRadiusPx = showLiveFrame
     ? Math.max(0, Math.round((frameOptions?.borderRadius ?? 18) * displayScale))
     : 12;
@@ -1577,8 +1692,27 @@ export default function EditorCanvas({
     [previewResult, tool, clientToImg, annotations, onSelectId, onChangeZoom]
   );
 
-  const totalPngW = viewWidth + (frameOptions?.padding ?? 44) * 2;
-  const totalPngH = viewHeight + (frameOptions?.padding ?? 44) * 2;
+  const totalPngW = viewWidth + padLeftVal + padRightVal;
+  const totalPngH = viewHeight + padTopVal + padBottomVal;
+
+  const vectorShapes = useMemo(() => {
+    const base = annotations.filter(
+      (a) => (a.kind === "rect" || a.kind === "arrow") && a.visible !== false
+    );
+    if (draftAnn && (draftAnn.kind === "rect" || draftAnn.kind === "arrow")) {
+      return [...base, draftAnn];
+    }
+    return base;
+  }, [annotations, draftAnn]);
+
+  const vectorTexts = useMemo(
+    () =>
+      annotations.filter(
+        (a): a is TextAnnotation =>
+          a.kind === "text" && a.visible !== false && a.id !== editingTextId
+      ),
+    [annotations, editingTextId]
+  );
 
   // Keep the Before/After comparison handle vertically centered inside the visible viewport
   const splitHandleTopPx = Math.max(
@@ -1608,18 +1742,49 @@ export default function EditorCanvas({
       <div
         className={`absolute left-0 top-0 will-change-transform ${
           showLiveFrame
-            ? "border border-dashed border-cyan-400/50 bg-cyan-400/[0.025] rounded-lg"
+            ? editingPadding
+              ? "border-2 border-dashed border-cyan-300 bg-cyan-400/[0.045] rounded-lg"
+              : "border border-dashed border-cyan-400/50 bg-cyan-400/[0.025] rounded-lg"
             : ""
         }`}
         style={{
-          transform: `translate3d(${cam.x - framePadPx}px, ${cam.y - framePadPx}px, 0)`,
-          padding: framePadPx,
+          transform: `translate3d(${cam.x - padLeftPx}px, ${cam.y - padTopPx}px, 0)`,
+          padding: `${padTopPx}px ${padRightPx}px ${padBottomPx}px ${padLeftPx}px`,
         }}
       >
         {showLiveFrame && (
           <div className="pointer-events-none absolute -top-6 left-0 px-2 py-0.5 rounded-md bg-[#090D16]/90 border border-cyan-400/35 text-[10px] font-medium text-cyan-200 whitespace-nowrap shadow-md">
-            PNG · {totalPngW}×{totalPngH} px · Margen {frameOptions?.padding ?? 44}px
+            PNG · {totalPngW}×{totalPngH} px · Margen{" "}
+            {frameOptions?.customPadding
+              ? `${padTopVal}/${padRightVal}/${padBottomVal}/${padLeftVal}px`
+              : `${padTopVal}px`}
           </div>
+        )}
+
+        {/* Interactive 4-Side + 4-Corner Padding Handles when editingPadding is active */}
+        {showLiveFrame && editingPadding && (
+          <>
+            {(
+              [
+                { dir: "n", cls: "-top-2 left-1/2 -translate-x-1/2 w-8 h-3 cursor-ns-resize" },
+                { dir: "s", cls: "-bottom-2 left-1/2 -translate-x-1/2 w-8 h-3 cursor-ns-resize" },
+                { dir: "w", cls: "top-1/2 -left-2 -translate-y-1/2 w-3 h-8 cursor-ew-resize" },
+                { dir: "e", cls: "top-1/2 -right-2 -translate-y-1/2 w-3 h-8 cursor-ew-resize" },
+                { dir: "nw", cls: "-top-2 -left-2 w-4 h-4 cursor-nwse-resize" },
+                { dir: "ne", cls: "-top-2 -right-2 w-4 h-4 cursor-nesw-resize" },
+                { dir: "sw", cls: "-bottom-2 -left-2 w-4 h-4 cursor-nesw-resize" },
+                { dir: "se", cls: "-bottom-2 -right-2 w-4 h-4 cursor-nwse-resize" },
+              ] as const
+            ).map((h) => (
+              <div
+                key={h.dir}
+                data-resize-handle
+                onPointerDown={(e) => startPaddingHandleDrag(h.dir, e)}
+                title="Arrastra para ajustar el margen transparente"
+                className={`pointer-events-auto absolute rounded-full bg-cyan-300 border-2 border-slate-950 shadow-[0_0_12px_rgba(34,211,238,0.85)] hover:scale-120 transition-transform z-30 ${h.cls}`}
+              />
+            ))}
+          </>
         )}
 
         {previewResult ? (
@@ -1733,6 +1898,210 @@ export default function EditorCanvas({
                 style={{ width: displayW, height: displayH }}
                 className="block"
               />
+
+              {/* Crisp Animated Vector Layer for Arrows & Rectangles */}
+              <svg
+                viewBox={`${viewOffsetX} ${viewOffsetY} ${viewWidth} ${viewHeight}`}
+                className="pointer-events-none absolute inset-0 w-full h-full overflow-visible"
+              >
+                <defs>
+                  <filter id="up-vec-shadow" x="-20%" y="-20%" width="140%" height="140%">
+                    <feDropShadow dx="0" dy="2" stdDeviation="3" floodColor="#000000" floodOpacity="0.45" />
+                  </filter>
+                </defs>
+                <AnimatePresence>
+                  {vectorShapes.map((ann) => {
+                    if (ann.kind === "rect") {
+                      const cx = ann.x + ann.width * 0.5;
+                      const cy = ann.y + ann.height * 0.5;
+                      return (
+                        <motion.g
+                          key={ann.id}
+                          initial={{ opacity: 0, scale: 0.88 }}
+                          animate={{ opacity: 1, scale: 1 }}
+                          exit={{ opacity: 0, scale: 0.82 }}
+                          transition={{ type: "spring", stiffness: 460, damping: 32 }}
+                          style={{ transformOrigin: `${cx}px ${cy}px` }}
+                          filter="url(#up-vec-shadow)"
+                        >
+                          <rect
+                            x={ann.x}
+                            y={ann.y}
+                            width={Math.max(0, ann.width)}
+                            height={Math.max(0, ann.height)}
+                            rx={4}
+                            ry={4}
+                            fill="none"
+                            stroke={ann.color}
+                            strokeWidth={ann.strokeWidth}
+                          />
+                        </motion.g>
+                      );
+                    }
+                    if (ann.kind === "arrow") {
+                      const dx = ann.x2 - ann.x1;
+                      const dy = ann.y2 - ann.y1;
+                      const len = Math.hypot(dx, dy);
+                      if (len < 2) return null;
+                      const angle = Math.atan2(dy, dx);
+                      const headLen = Math.max(14, ann.strokeWidth * 4.2);
+                      const shaftEndX = ann.x2 - Math.cos(angle) * (headLen * 0.68);
+                      const shaftEndY = ann.y2 - Math.sin(angle) * (headLen * 0.68);
+                      const p1x = ann.x2 - headLen * Math.cos(angle - Math.PI / 6);
+                      const p1y = ann.y2 - headLen * Math.sin(angle - Math.PI / 6);
+                      const p2x = ann.x2 - headLen * Math.cos(angle + Math.PI / 6);
+                      const p2y = ann.y2 - headLen * Math.sin(angle + Math.PI / 6);
+                      const mx = (ann.x1 + ann.x2) * 0.5;
+                      const my = (ann.y1 + ann.y2) * 0.5;
+                      return (
+                        <motion.g
+                          key={ann.id}
+                          initial={{ opacity: 0, scale: 0.85 }}
+                          animate={{ opacity: 1, scale: 1 }}
+                          exit={{ opacity: 0, scale: 0.8 }}
+                          transition={{ type: "spring", stiffness: 460, damping: 32 }}
+                          style={{ transformOrigin: `${mx}px ${my}px` }}
+                          filter="url(#up-vec-shadow)"
+                        >
+                          <line
+                            x1={ann.x1}
+                            y1={ann.y1}
+                            x2={shaftEndX}
+                            y2={shaftEndY}
+                            stroke={ann.color}
+                            strokeWidth={ann.strokeWidth}
+                            strokeLinecap="round"
+                          />
+                          <polygon
+                            points={`${ann.x2},${ann.y2} ${p1x},${p1y} ${p2x},${p2y}`}
+                            fill={ann.color}
+                          />
+                        </motion.g>
+                      );
+                    }
+                    return null;
+                  })}
+                </AnimatePresence>
+              </svg>
+
+              {/* Crisp Animated Vector Text Overlay (never pixelates at any zoom!) */}
+              <div className="pointer-events-none absolute inset-0 overflow-hidden">
+                <AnimatePresence>
+                  {vectorTexts.map((ann) => {
+                    const bgStyle = resolveTextBgStyle(ann);
+                    const bgColor = ann.bgColor || "#090D16";
+                    const bgColor2 = ann.bgColor2 || "#4F46E5";
+                    const bgOpacity =
+                      ann.bgOpacity ??
+                      (bgStyle === "glass"
+                        ? 0.82
+                        : bgStyle === "highlight"
+                          ? 0.48
+                          : 0.96);
+                    const padX =
+                      (ann.paddingX ??
+                        Math.round(Math.max(10, ann.fontSize * 0.42))) *
+                      displayScale;
+                    const padY =
+                      (ann.paddingY ??
+                        Math.round(Math.max(6, ann.fontSize * 0.25))) *
+                      displayScale;
+                    const offX = (ann.textOffsetX ?? 0) * displayScale;
+                    const offY = (ann.textOffsetY ?? 0) * displayScale;
+                    const cornerR =
+                      (ann.borderRadius ?? (bgStyle === "highlight" ? 6 : 12)) *
+                      displayScale;
+                    const activeFont =
+                      previewFontFamily && ann.id === selectedId
+                        ? previewFontFamily
+                        : ann.fontFamily;
+
+                    const bgCss: React.CSSProperties =
+                      bgStyle === "glass"
+                        ? {
+                            backgroundColor: hexToRgba(bgColor, bgOpacity),
+                            border: `${Math.max(1, 1.5 * displayScale)}px solid rgba(255,255,255,0.22)`,
+                            borderRadius: cornerR,
+                            boxShadow: "0 4px 18px rgba(0,0,0,0.42)",
+                          }
+                        : bgStyle === "solid"
+                          ? {
+                              backgroundColor: hexToRgba(bgColor, bgOpacity),
+                              borderRadius: cornerR,
+                              boxShadow: "0 4px 16px rgba(0,0,0,0.36)",
+                            }
+                          : bgStyle === "gradient"
+                            ? {
+                                backgroundImage: `linear-gradient(135deg, ${hexToRgba(bgColor, bgOpacity)}, ${hexToRgba(bgColor2, bgOpacity)})`,
+                                border: "1px solid rgba(255,255,255,0.18)",
+                                borderRadius: cornerR,
+                                boxShadow: "0 4px 18px rgba(0,0,0,0.4)",
+                              }
+                            : bgStyle === "outline"
+                              ? {
+                                  backgroundColor: hexToRgba(
+                                    bgColor,
+                                    bgOpacity * 0.3
+                                  ),
+                                  border: `${Math.max(1.5, ann.fontSize * 0.08 * displayScale)}px solid ${ann.color}`,
+                                  borderRadius: cornerR,
+                                }
+                              : bgStyle === "highlight"
+                                ? {
+                                    backgroundColor: hexToRgba(
+                                      bgColor,
+                                      bgOpacity * 0.65
+                                    ),
+                                    borderRadius: cornerR,
+                                  }
+                                : {};
+
+                    const shadowCss =
+                      (ann.shadowEnabled ?? true) && (ann.shadowBlur ?? 4) > 0
+                        ? `0 ${(ann.shadowOffsetY ?? 2) * displayScale}px ${(ann.shadowBlur ?? 4) * displayScale}px ${hexToRgba(ann.shadowColor || "#000000", 0.72)}`
+                        : "none";
+
+                    return (
+                      <motion.div
+                        key={ann.id}
+                        initial={{ opacity: 0, scale: 0.86 }}
+                        animate={{ opacity: ann.opacity ?? 1, scale: 1 }}
+                        exit={{ opacity: 0, scale: 0.82 }}
+                        transition={{
+                          type: "spring",
+                          stiffness: 460,
+                          damping: 32,
+                        }}
+                        style={{
+                          left: (ann.x - viewOffsetX) * displayScale - padX,
+                          top: (ann.y - viewOffsetY) * displayScale - padY,
+                          paddingLeft: padX,
+                          paddingRight: padX,
+                          paddingTop: padY,
+                          paddingBottom: padY,
+                          ...bgCss,
+                        }}
+                        className="absolute whitespace-pre"
+                      >
+                        <div
+                          style={{
+                            transform: `translate(${offX}px, ${offY}px)`,
+                            fontSize: ann.fontSize * displayScale,
+                            lineHeight: 1.25,
+                            fontFamily: getFontStack(activeFont),
+                            color: ann.color,
+                            fontWeight: ann.bold ? 700 : 500,
+                            fontStyle: ann.italic ? "italic" : "normal",
+                            textShadow: shadowCss,
+                          }}
+                        >
+                          {ann.text || " "}
+                        </div>
+                      </motion.div>
+                    );
+                  })}
+                </AnimatePresence>
+              </div>
             </div>
 
             {frameBorderOverlayStyle && (
@@ -1771,7 +2140,8 @@ export default function EditorCanvas({
                     </button>
 
                     {(selectedAnn.kind === "rect" ||
-                      selectedAnn.kind === "blur") &&
+                      selectedAnn.kind === "blur" ||
+                      selectedAnn.kind === "text") &&
                       (
                         [
                           { dir: "nw", cls: "-top-1.5 -left-1.5 cursor-nwse-resize" },
@@ -1952,7 +2322,9 @@ export default function EditorCanvas({
                       paddingBottom: Math.max(0, padY - offY),
                       fontSize: scaledFont,
                       lineHeight: 1.25,
-                      fontFamily: getFontStack(editingTextAnn.fontFamily),
+                      fontFamily: getFontStack(
+                        previewFontFamily || editingTextAnn.fontFamily
+                      ),
                       color: editingTextAnn.color,
                       fontWeight: editingTextAnn.bold ? 700 : 500,
                       fontStyle: editingTextAnn.italic ? "italic" : "normal",
@@ -2060,9 +2432,7 @@ export default function EditorCanvas({
         className="pointer-events-none absolute bottom-4 right-4 z-30 flex items-center gap-2"
       >
         <div className="hidden sm:flex items-center px-2.5 py-1.5 rounded-xl bg-[#090D16]/88 border border-white/10 text-[11px] text-slate-300 backdrop-blur-xl shadow-lg">
-          {previewResult
-            ? "Rueda: zoom · Arrastra: mover"
-            : "Rueda: zoom · Arrastra o Espacio: mover"}
+          Rueda: zoom · Arrastra: mover
         </div>
         <div className="pointer-events-auto flex items-center gap-1 px-1.5 py-1 rounded-xl bg-[#090D16]/92 border border-white/15 backdrop-blur-xl shadow-2xl">
           <button

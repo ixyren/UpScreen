@@ -297,6 +297,144 @@ pub fn crop_image(img: &RgbaImage, x: u32, y: u32, w: u32, h: u32) -> Result<Rgb
     Ok(image::imageops::crop_imm(img, x, y, cw, ch).to_image())
 }
 
+/// Captures a specific window directly using `PrintWindow(PW_RENDERFULLCONTENT)` against
+/// black and white backgrounds (exact dual-background alpha matting) so rounded corners
+/// (Windows 11) and non-rectangular/transparent window borders stay cleanly transparent
+/// instead of leaking whatever desktop wallpaper or window sits behind it.
+pub fn capture_window_transparent(hwnd_raw: isize) -> Result<RgbaImage, String> {
+    use windows::Win32::Graphics::Gdi::{
+        CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, SelectObject, BITMAPINFO,
+        BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS,
+    };
+    use windows::Win32::Storage::Xps::{PrintWindow, PRINT_WINDOW_FLAGS};
+
+    let hwnd = HWND(hwnd_raw as *mut c_void);
+    unsafe {
+        if !IsWindowVisible(hwnd).as_bool() {
+            return Err("La ventana ya no es visible".into());
+        }
+
+        let mut win_rect = RECT::default();
+        GetWindowRect(hwnd, &mut win_rect)
+            .map_err(|e| format!("GetWindowRect falló: {e}"))?;
+        let full_w = (win_rect.right - win_rect.left).max(0) as u32;
+        let full_h = (win_rect.bottom - win_rect.top).max(0) as u32;
+        if full_w < 8 || full_h < 8 || full_w > 12000 || full_h > 12000 {
+            return Err("Dimensiones de ventana inválidas".into());
+        }
+
+        let mut ext_rect = win_rect;
+        let _ = DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_EXTENDED_FRAME_BOUNDS,
+            &mut ext_rect as *mut RECT as *mut c_void,
+            size_of::<RECT>() as u32,
+        );
+
+        let render_on_bg = |bg_byte: u8| -> Result<Vec<u8>, String> {
+            let mem_dc = CreateCompatibleDC(None);
+            if mem_dc.is_invalid() {
+                return Err("CreateCompatibleDC falló".into());
+            }
+
+            let mut bmi = BITMAPINFO::default();
+            bmi.bmiHeader = BITMAPINFOHEADER {
+                biSize: size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: full_w as i32,
+                biHeight: -(full_h as i32), // top-down
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            };
+
+            let mut bits_ptr: *mut c_void = std::ptr::null_mut();
+            let hbm = CreateDIBSection(mem_dc, &bmi, DIB_RGB_COLORS, &mut bits_ptr, None, 0)
+                .map_err(|e| {
+                    let _ = DeleteDC(mem_dc);
+                    format!("CreateDIBSection falló: {e}")
+                })?;
+
+            if bits_ptr.is_null() {
+                let _ = DeleteObject(hbm);
+                let _ = DeleteDC(mem_dc);
+                return Err("DIB buffer nulo".into());
+            }
+
+            let old = SelectObject(mem_dc, hbm);
+            let byte_len = (full_w as usize) * (full_h as usize) * 4;
+            let slice = std::slice::from_raw_parts_mut(bits_ptr as *mut u8, byte_len);
+            slice.fill(bg_byte);
+
+            // PW_RENDERFULLCONTENT = 0x00000002
+            let ok = PrintWindow(hwnd, mem_dc, PRINT_WINDOW_FLAGS(2)).as_bool();
+            let out_bytes = slice.to_vec();
+
+            SelectObject(mem_dc, old);
+            let _ = DeleteObject(hbm);
+            let _ = DeleteDC(mem_dc);
+
+            if !ok {
+                return Err("PrintWindow no soportado por esta ventana".into());
+            }
+            Ok(out_bytes)
+        };
+
+        let on_black = render_on_bg(0u8)?;
+        let on_white = render_on_bg(255u8)?;
+
+        // Compute exact RGBA via dual-background alpha matting
+        let mut full_rgba = RgbaImage::new(full_w, full_h);
+        let mut non_empty_pixels: u64 = 0;
+
+        for y in 0..full_h {
+            for x in 0..full_w {
+                let idx = ((y as usize) * (full_w as usize) + (x as usize)) * 4;
+                let bb = on_black[idx] as i32;
+                let bg = on_black[idx + 1] as i32;
+                let br = on_black[idx + 2] as i32;
+
+                let wb = on_white[idx] as i32;
+                let wg = on_white[idx + 1] as i32;
+                let wr = on_white[idx + 2] as i32;
+
+                // Alpha = 255 - avg(white - black)
+                let diff = ((wr - br) + (wg - bg) + (wb - bb)) / 3;
+                let alpha = (255 - diff).clamp(0, 255);
+
+                if alpha <= 2 {
+                    full_rgba.put_pixel(x, y, image::Rgba([0, 0, 0, 0]));
+                } else {
+                    non_empty_pixels += 1;
+                    let r = ((br * 255) / alpha).clamp(0, 255) as u8;
+                    let g = ((bg * 255) / alpha).clamp(0, 255) as u8;
+                    let b = ((bb * 255) / alpha).clamp(0, 255) as u8;
+                    full_rgba.put_pixel(x, y, image::Rgba([r, g, b, alpha as u8]));
+                }
+            }
+        }
+
+        // If PrintWindow returned an almost blank image (e.g. DRM/exclusive DX), fallback
+        if non_empty_pixels < ((full_w as u64 * full_h as u64) / 25) {
+            return Err("PrintWindow devolvió contenido vacío".into());
+        }
+
+        // Crop to DWM extended frame bounds relative to GetWindowRect
+        let crop_x = (ext_rect.left - win_rect.left).clamp(0, full_w as i32) as u32;
+        let crop_y = (ext_rect.top - win_rect.top).clamp(0, full_h as i32) as u32;
+        let crop_r = (ext_rect.right - win_rect.left).clamp(crop_x as i32, full_w as i32) as u32;
+        let crop_b = (ext_rect.bottom - win_rect.top).clamp(crop_y as i32, full_h as i32) as u32;
+        let cw = crop_r.saturating_sub(crop_x);
+        let ch = crop_b.saturating_sub(crop_y);
+
+        if cw >= 8 && ch >= 8 {
+            crop_image(&full_rgba, crop_x, crop_y, cw, ch)
+        } else {
+            Ok(full_rgba)
+        }
+    }
+}
+
 struct MonitorEnumContext {
     origin_x: i32,
     origin_y: i32,
