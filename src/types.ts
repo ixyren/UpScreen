@@ -64,12 +64,24 @@ export interface OverlaySessionPayload {
 export type AiQualityMode = "supersample" | "tta" | "raw";
 export type TextProtectionMode = AiQualityMode;
 
+export type BorderPosition = "inside" | "center" | "outside";
+
 export interface FrameOptions {
   enabled: boolean;
   borderRadius: number;
   padding: number;
-  shadowStrength: "soft" | "medium" | "strong";
+  shadowStrength: "none" | "soft" | "medium" | "strong" | "custom";
   subtleBorder: boolean;
+  borderWidth: number;
+  borderColor: string;
+  borderOpacity: number;
+  borderPosition: BorderPosition;
+  shadowColor: string;
+  shadowOffsetX: number;
+  shadowOffsetY: number;
+  shadowBlur: number;
+  shadowSpread: number;
+  shadowOpacity: number;
 }
 
 export interface EditorCapturePayload {
@@ -127,21 +139,73 @@ export type UpscaleModel =
   | "realesr-animevideov3"
   | "crisp-ui";
 
+export type TextBgStyle =
+  | "none"
+  | "glass"
+  | "solid"
+  | "outline"
+  | "highlight"
+  | "gradient";
+export type TextFontFamily = string;
+export type BlurMode = "gaussian" | "pixelate";
+
+export interface TextStyleConfig {
+  fontFamily: string;
+  fontSize: number;
+  color: string;
+  bold: boolean;
+  italic: boolean;
+  bgStyle: TextBgStyle;
+  bgColor: string;
+  bgColor2: string;
+  bgOpacity: number;
+  paddingX: number;
+  paddingY: number;
+  textOffsetX: number;
+  textOffsetY: number;
+  borderRadius: number;
+  opacity: number;
+  shadowEnabled: boolean;
+  shadowBlur: number;
+  shadowColor: string;
+  shadowOffsetY: number;
+}
+
 export interface TextAnnotation {
   id: string;
   kind: "text";
+  name?: string;
+  visible?: boolean;
   x: number;
   y: number;
   text: string;
   fontSize: number;
+  fontFamily?: string;
   color: string;
   bold: boolean;
+  italic?: boolean;
   hasPill: boolean;
+  bgStyle?: TextBgStyle;
+  bgColor?: string;
+  bgColor2?: string;
+  bgOpacity?: number;
+  paddingX?: number;
+  paddingY?: number;
+  textOffsetX?: number;
+  textOffsetY?: number;
+  borderRadius?: number;
+  opacity?: number;
+  shadowEnabled?: boolean;
+  shadowBlur?: number;
+  shadowColor?: string;
+  shadowOffsetY?: number;
 }
 
 export interface RectAnnotation {
   id: string;
   kind: "rect";
+  name?: string;
+  visible?: boolean;
   x: number;
   y: number;
   width: number;
@@ -153,6 +217,8 @@ export interface RectAnnotation {
 export interface ArrowAnnotation {
   id: string;
   kind: "arrow";
+  name?: string;
+  visible?: boolean;
   x1: number;
   y1: number;
   x2: number;
@@ -164,11 +230,15 @@ export interface ArrowAnnotation {
 export interface BlurAnnotation {
   id: string;
   kind: "blur";
+  name?: string;
+  visible?: boolean;
   x: number;
   y: number;
   width: number;
   height: number;
+  mode?: BlurMode;
   intensity: number;
+  borderRadius?: number;
 }
 
 export type Annotation =

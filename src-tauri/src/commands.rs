@@ -841,3 +841,61 @@ pub fn resize_dock(app: AppHandle, width: f64, height: f64) -> Result<(), String
     }
     Ok(())
 }
+
+#[tauri::command]
+pub fn list_system_fonts() -> Vec<String> {
+    use std::collections::BTreeSet;
+    use windows::Win32::Foundation::LPARAM;
+    use windows::Win32::Graphics::Gdi::{
+        EnumFontFamiliesExW, GetDC, ReleaseDC, DEFAULT_CHARSET, LOGFONTW, TEXTMETRICW,
+    };
+
+    unsafe extern "system" fn enum_proc(
+        lpelfe: *const LOGFONTW,
+        _lpntme: *const TEXTMETRICW,
+        _font_type: u32,
+        lparam: LPARAM,
+    ) -> i32 {
+        if !lpelfe.is_null() && lparam.0 != 0 {
+            let lf = &*lpelfe;
+            let len = lf
+                .lfFaceName
+                .iter()
+                .position(|&c| c == 0)
+                .unwrap_or(lf.lfFaceName.len());
+            if len > 0 {
+                let name = String::from_utf16_lossy(&lf.lfFaceName[..len]);
+                let trimmed = name.trim();
+                if !trimmed.is_empty() && !trimmed.starts_with('@') {
+                    let set = &mut *(lparam.0 as *mut BTreeSet<String>);
+                    set.insert(trimmed.to_string());
+                }
+            }
+        }
+        1
+    }
+
+    let mut fonts = BTreeSet::<String>::new();
+    unsafe {
+        let hdc = GetDC(None);
+        if !hdc.is_invalid() {
+            let mut lf = LOGFONTW::default();
+            lf.lfCharSet = DEFAULT_CHARSET;
+            let ptr = &mut fonts as *mut BTreeSet<String> as isize;
+            EnumFontFamiliesExW(hdc, &lf, Some(enum_proc), LPARAM(ptr), 0);
+            let _ = ReleaseDC(None, hdc);
+        }
+    }
+
+    if fonts.is_empty() {
+        return vec![
+            "Segoe UI".to_string(),
+            "Arial".to_string(),
+            "Consolas".to_string(),
+            "Georgia".to_string(),
+            "Impact".to_string(),
+        ];
+    }
+
+    fonts.into_iter().collect()
+}

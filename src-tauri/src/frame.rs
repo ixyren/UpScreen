@@ -17,6 +17,60 @@ fn default_subtle_border() -> bool {
     true
 }
 
+fn default_border_width() -> f32 {
+    1.5
+}
+
+fn default_border_color() -> String {
+    "#FFFFFF".to_string()
+}
+
+fn default_border_opacity() -> f32 {
+    0.24
+}
+
+fn default_shadow_color() -> String {
+    "#000000".to_string()
+}
+
+fn default_border_position() -> String {
+    "inside".to_string()
+}
+
+fn default_shadow_offset_x() -> f32 {
+    0.0
+}
+
+fn default_shadow_offset_y() -> f32 {
+    12.0
+}
+
+fn default_shadow_blur() -> f32 {
+    24.0
+}
+
+fn default_shadow_spread() -> f32 {
+    0.0
+}
+
+fn default_shadow_opacity() -> f32 {
+    0.65
+}
+
+fn parse_hex_rgb(hex: &str, fallback: [f32; 3]) -> [f32; 3] {
+    let s = hex.trim().trim_start_matches('#');
+    if s.len() == 6 {
+        if let (Ok(r), Ok(g), Ok(b)) = (
+            u8::from_str_radix(&s[0..2], 16),
+            u8::from_str_radix(&s[2..4], 16),
+            u8::from_str_radix(&s[4..6], 16),
+        ) {
+            return [r as f32, g as f32, b as f32];
+        }
+    }
+    fallback
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FrameOptions {
@@ -29,6 +83,26 @@ pub struct FrameOptions {
     pub shadow_strength: String,
     #[serde(default = "default_subtle_border")]
     pub subtle_border: bool,
+    #[serde(default = "default_border_width")]
+    pub border_width: f32,
+    #[serde(default = "default_border_color")]
+    pub border_color: String,
+    #[serde(default = "default_border_opacity")]
+    pub border_opacity: f32,
+    #[serde(default = "default_border_position")]
+    pub border_position: String,
+    #[serde(default = "default_shadow_color")]
+    pub shadow_color: String,
+    #[serde(default = "default_shadow_offset_x")]
+    pub shadow_offset_x: f32,
+    #[serde(default = "default_shadow_offset_y")]
+    pub shadow_offset_y: f32,
+    #[serde(default = "default_shadow_blur")]
+    pub shadow_blur: f32,
+    #[serde(default = "default_shadow_spread")]
+    pub shadow_spread: f32,
+    #[serde(default = "default_shadow_opacity")]
+    pub shadow_opacity: f32,
 }
 
 impl Default for FrameOptions {
@@ -39,6 +113,16 @@ impl Default for FrameOptions {
             padding: 44,
             shadow_strength: "medium".to_string(),
             subtle_border: true,
+            border_width: 1.5,
+            border_color: "#FFFFFF".to_string(),
+            border_opacity: 0.24,
+            border_position: "inside".to_string(),
+            shadow_color: "#000000".to_string(),
+            shadow_offset_x: 0.0,
+            shadow_offset_y: 12.0,
+            shadow_blur: 24.0,
+            shadow_spread: 0.0,
+            shadow_opacity: 0.65,
         }
     }
 }
@@ -119,17 +203,45 @@ pub fn apply_rounded_shadow_frame(
 
     let sf = scale_factor.clamp(1.0, 16.0);
     let max_dim = w.max(h);
-    let (base_alpha, base_blur, base_offset_y) = match opts.shadow_strength.as_str() {
-        "soft" => (0.42f32, 16.0f32, 8.0f32),
-        "strong" => (0.84f32, 34.0f32, 18.0f32),
-        _ => (0.65f32, 24.0f32, 12.0f32),
+    let (base_alpha, base_blur, base_offset_x, base_offset_y, base_spread) =
+        match opts.shadow_strength.as_str() {
+            "none" => (0.0f32, 0.0f32, 0.0f32, 0.0f32, 0.0f32),
+            "soft" => (0.42f32, 16.0f32, 0.0f32, 8.0f32, 0.0f32),
+            "strong" => (0.84f32, 34.0f32, 0.0f32, 18.0f32, 0.0f32),
+            "custom" => (
+                opts.shadow_opacity.clamp(0.0, 1.0),
+                opts.shadow_blur.clamp(0.0, 120.0),
+                opts.shadow_offset_x.clamp(-80.0, 80.0),
+                opts.shadow_offset_y.clamp(-80.0, 80.0),
+                opts.shadow_spread.clamp(-24.0, 48.0),
+            ),
+            _ => (0.65f32, 24.0f32, 0.0f32, 12.0f32, 0.0f32),
+        };
+
+    let bw = (opts.border_width.clamp(0.0, 16.0) * sf).clamp(0.0, 64.0);
+    let b_op = opts.border_opacity.clamp(0.0, 1.0);
+    let draw_border = opts.subtle_border && bw > 0.05 && b_op > 0.005;
+    let border_outer_extent = if !draw_border {
+        0.0
+    } else {
+        match opts.border_position.as_str() {
+            "outside" => bw,
+            "center" => bw * 0.5,
+            _ => 0.0,
+        }
     };
 
     let mut blur_r = base_blur * sf;
+    let mut offset_x = base_offset_x * sf;
     let mut offset_y = base_offset_y * sf;
-    let mut pad = ((opts.padding as f32) * sf)
-        .round()
-        .max((blur_r * 1.5 + offset_y).ceil()) as u32;
+    let mut spread = base_spread * sf;
+    let shadow_pad = if base_alpha > 0.001 {
+        (blur_r * 1.45 + offset_x.abs().max(offset_y.abs()) + spread.max(0.0)).ceil()
+    } else {
+        0.0
+    };
+    let min_pad = shadow_pad.max((border_outer_extent + 2.0).ceil());
+    let mut pad = ((opts.padding as f32) * sf).round().max(min_pad) as u32;
 
     // Keep final dimensions safely within 16384 px
     if max_dim + pad.saturating_mul(2) > 16384 {
@@ -140,7 +252,9 @@ pub fn apply_rounded_shadow_frame(
         let ratio = avail_pad as f32 / (pad.max(1) as f32);
         pad = avail_pad;
         blur_r *= ratio;
+        offset_x *= ratio;
         offset_y *= ratio;
+        spread *= ratio;
     }
 
     let out_w = w + pad * 2;
@@ -153,71 +267,113 @@ pub fn apply_rounded_shadow_frame(
     let pad_f = pad as f32;
     let rad = (opts.border_radius.max(0.0) * sf).min(wf.min(hf) * 0.45);
 
-    // 1. Build shadow mask shifted by (pad, pad + offset_y)
+    // 1. Build shadow mask shifted by (pad + offset_x, pad + offset_y) with optional spread
     let mut shadow = vec![0.0f32; out_wu * out_hu];
-    let shadow_top = pad_f + offset_y;
-    let x_min = (pad_f - 2.0).floor().max(0.0) as usize;
-    let x_max = (pad_f + wf + 2.0).ceil().min(out_wu as f32) as usize;
-    let y_min = (shadow_top - 2.0).floor().max(0.0) as usize;
-    let y_max = (shadow_top + hf + 2.0).ceil().min(out_hu as f32) as usize;
+    if base_alpha > 0.001 {
+        let sw = (wf + spread * 2.0).max(2.0);
+        let sh = (hf + spread * 2.0).max(2.0);
+        let s_left = pad_f + offset_x - spread;
+        let s_top = pad_f + offset_y - spread;
+        let s_rad = (rad + spread.max(0.0)).min(sw.min(sh) * 0.45);
 
-    for y in y_min..y_max {
-        let py = y as f32 + 0.5;
-        let row = y * out_wu;
-        for x in x_min..x_max {
-            let px = x as f32 + 0.5;
-            let sdf = sd_rounded_rect(px, py, pad_f, shadow_top, wf, hf, rad);
-            let cov = (0.5 - sdf).clamp(0.0, 1.0);
-            shadow[row + x] = cov * base_alpha;
+        let x_min = (s_left - 2.0).floor().max(0.0) as usize;
+        let x_max = (s_left + sw + 2.0).ceil().min(out_wu as f32) as usize;
+        let y_min = (s_top - 2.0).floor().max(0.0) as usize;
+        let y_max = (s_top + sh + 2.0).ceil().min(out_hu as f32) as usize;
+
+        for y in y_min..y_max {
+            let py = y as f32 + 0.5;
+            let row = y * out_wu;
+            for x in x_min..x_max {
+                let px = x as f32 + 0.5;
+                let sdf = sd_rounded_rect(px, py, s_left, s_top, sw, sh, s_rad);
+                let cov = (0.5 - sdf).clamp(0.0, 1.0);
+                shadow[row + x] = cov * base_alpha;
+            }
+        }
+
+        if blur_r >= 1.0 {
+            let box_r = (blur_r * 0.42).round().max(1.0) as usize;
+            box_blur_3pass(&mut shadow, out_wu, out_hu, box_r);
         }
     }
 
-    let box_r = (blur_r * 0.42).round().max(1.0) as usize;
-    box_blur_3pass(&mut shadow, out_wu, out_hu, box_r);
-
-    // 2. Render output canvas: shadow first, then rounded foreground + optional crisp glass rim
+    // 2. Render output canvas: shadow first, then rounded foreground + inside/center/outside border
     let mut out = RgbaImage::new(out_w, out_h);
-    let bw = (1.5 * sf).clamp(1.0, 4.0);
+    let b_rgb = parse_hex_rgb(&opts.border_color, [255.0, 255.0, 255.0]);
+    let s_rgb = parse_hex_rgb(&opts.shadow_color, [0.0, 0.0, 0.0]);
+    let (b_inner, b_outer) = match opts.border_position.as_str() {
+        "outside" => (0.0f32, bw),
+        "center" => (-bw * 0.5, bw * 0.5),
+        _ => (-bw, 0.0f32),
+    };
+    let ext_px = (border_outer_extent + 2.0).ceil() as usize;
+    let bx_min = (pad as usize).saturating_sub(ext_px);
+    let bx_max = ((pad + w) as usize + ext_px).min(out_wu);
+    let by_min = (pad as usize).saturating_sub(ext_px);
+    let by_max = ((pad + h) as usize + ext_px).min(out_hu);
 
     for y in 0..out_hu {
         let row = y * out_wu;
         let py = y as f32 + 0.5;
         let in_y = y >= pad as usize && y < (pad + h) as usize;
+        let in_border_y = y >= by_min && y < by_max;
 
         for x in 0..out_wu {
             let bg_a = shadow[row + x].clamp(0.0, 1.0);
+            let in_img = in_y && x >= pad as usize && x < (pad + w) as usize;
+            let in_border_box = draw_border && in_border_y && x >= bx_min && x < bx_max;
 
-            if in_y && x >= pad as usize && x < (pad + w) as usize {
-                let src_px = img.get_pixel((x as u32) - pad, (y as u32) - pad);
+            if in_img || in_border_box {
                 let px = x as f32 + 0.5;
                 let sdf = sd_rounded_rect(px, py, pad_f, pad_f, wf, hf, rad);
-                let cov = (0.5 - sdf).clamp(0.0, 1.0);
-                let src_a_norm = (src_px[3] as f32) / 255.0;
-                let fg_a = (src_a_norm * cov).clamp(0.0, 1.0);
 
-                let b_a = if opts.subtle_border {
-                    let inner_cov = (0.5 - (sdf + bw)).clamp(0.0, 1.0);
-                    (cov - inner_cov).clamp(0.0, 1.0) * 0.24 * src_a_norm
+                let (src_r, src_g, src_b, fg_a, src_a_norm) = if in_img {
+                    let src_px = img.get_pixel((x as u32) - pad, (y as u32) - pad);
+                    let cov = (0.5 - sdf).clamp(0.0, 1.0);
+                    let a_norm = (src_px[3] as f32) / 255.0;
+                    (
+                        src_px[0] as f32,
+                        src_px[1] as f32,
+                        src_px[2] as f32,
+                        (a_norm * cov).clamp(0.0, 1.0),
+                        a_norm,
+                    )
+                } else {
+                    (0.0, 0.0, 0.0, 0.0, 1.0)
+                };
+
+                let b_a = if in_border_box {
+                    let outer_cov = (0.5 - (sdf - b_outer)).clamp(0.0, 1.0);
+                    let inner_cov = (0.5 - (sdf - b_inner)).clamp(0.0, 1.0);
+                    (outer_cov - inner_cov).clamp(0.0, 1.0) * b_op * src_a_norm
                 } else {
                     0.0
                 };
 
-                let fg_pm_r = (src_px[0] as f32) * fg_a * (1.0 - b_a) + 255.0 * b_a;
-                let fg_pm_g = (src_px[1] as f32) * fg_a * (1.0 - b_a) + 255.0 * b_a;
-                let fg_pm_b = (src_px[2] as f32) * fg_a * (1.0 - b_a) + 255.0 * b_a;
+                let fg_pm_r = src_r * fg_a * (1.0 - b_a) + b_rgb[0] * b_a;
+                let fg_pm_g = src_g * fg_a * (1.0 - b_a) + b_rgb[1] * b_a;
+                let fg_pm_b = src_b * fg_a * (1.0 - b_a) + b_rgb[2] * b_a;
                 let fg_total_a = (b_a + fg_a * (1.0 - b_a)).clamp(0.0, 1.0);
 
                 let out_a = (fg_total_a + bg_a * (1.0 - fg_total_a)).clamp(0.0, 1.0);
                 if out_a > 1e-5 {
-                    let r = (fg_pm_r / out_a).round().clamp(0.0, 255.0) as u8;
-                    let g = (fg_pm_g / out_a).round().clamp(0.0, 255.0) as u8;
-                    let b = (fg_pm_b / out_a).round().clamp(0.0, 255.0) as u8;
+                    let pm_r = fg_pm_r + s_rgb[0] * bg_a * (1.0 - fg_total_a);
+                    let pm_g = fg_pm_g + s_rgb[1] * bg_a * (1.0 - fg_total_a);
+                    let pm_b = fg_pm_b + s_rgb[2] * bg_a * (1.0 - fg_total_a);
+                    let r = (pm_r / out_a).round().clamp(0.0, 255.0) as u8;
+                    let g = (pm_g / out_a).round().clamp(0.0, 255.0) as u8;
+                    let b = (pm_b / out_a).round().clamp(0.0, 255.0) as u8;
                     let a = (out_a * 255.0).round().clamp(0.0, 255.0) as u8;
                     out.put_pixel(x as u32, y as u32, Rgba([r, g, b, a]));
                 }
             } else if bg_a > 1e-4 {
                 let a = (bg_a * 255.0).round().clamp(0.0, 255.0) as u8;
-                out.put_pixel(x as u32, y as u32, Rgba([0, 0, 0, a]));
+                out.put_pixel(
+                    x as u32,
+                    y as u32,
+                    Rgba([s_rgb[0] as u8, s_rgb[1] as u8, s_rgb[2] as u8, a]),
+                );
             }
         }
     }
@@ -242,6 +398,7 @@ mod tests {
             padding: 44,
             shadow_strength: "medium".to_string(),
             subtle_border: true,
+            ..FrameOptions::default()
         };
 
         let out = apply_rounded_shadow_frame(&src, &opts, 1.0);

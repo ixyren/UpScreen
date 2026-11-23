@@ -8,8 +8,8 @@ pub mod upscaler;
 use commands::{
     cancel_overlay_capture, confirm_overlay_capture, copy_edited_image,
     download_realesrgan_engine, get_editor_capture, get_overlay_session, get_system_status,
-    open_editor_window, position_dock_bottom_center, preview_upscale, quit_app, resize_dock,
-    save_edited_image, show_or_recreate_dock, show_ready_overlay, start_capture,
+    list_system_fonts, open_editor_window, position_dock_bottom_center, preview_upscale, quit_app,
+    resize_dock, save_edited_image, show_or_recreate_dock, show_ready_overlay, start_capture,
     sync_dock_settings, trigger_capture_from_backend, AppState, RegisteredShortcuts,
 };
 use std::time::Duration;
@@ -225,6 +225,7 @@ pub fn run() {
             download_realesrgan_engine,
             open_editor_window,
             resize_dock,
+            list_system_fonts,
         ])
         .run(tauri::generate_context!())
         .expect("error al ejecutar UpScreen");

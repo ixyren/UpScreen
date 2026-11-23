@@ -1,6 +1,6 @@
 [package]
 name = "upscreen"
-version = "1.0.0"
+version = "1.2.0"
 description = "UpScreen — Captura de pantalla en Windows con edición, aceleración NVENC/AMF y upscaling Real-ESRGAN"
 authors = ["UpScreen"]
 edition = "2021"

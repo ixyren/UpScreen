@@ -4,9 +4,12 @@ import type {
   Annotation,
   AspectPreset,
   BlurAnnotation,
+  BlurMode,
   CropRect,
   FrameOptions,
   TextAnnotation,
+  TextBgStyle,
+  TextStyleConfig,
   ToolType,
   UpscalePreviewResult,
 } from "../types";
@@ -20,12 +23,14 @@ interface EditorCanvasProps {
   selectedId: string | null;
   activeColor: string;
   strokeWidth: number;
-  fontSize: number;
-  textBold: boolean;
-  textHasPill: boolean;
+  textStyle: TextStyleConfig;
+  blurMode: BlurMode;
+  blurIntensity: number;
+  blurRadius: number;
   zoom: number | "fit";
   fitNonce?: number;
   cropRect: CropRect | null;
+  activeCrop: CropRect | null;
   aspectPreset: AspectPreset;
   previewResult: UpscalePreviewResult | null;
   frameOptions?: FrameOptions;
@@ -40,6 +45,33 @@ interface EditorCanvasProps {
   onChangeCropRect: (rect: CropRect | null) => void;
   onChangeZoom: (next: number | "fit") => void;
   onCheckpointHistory?: () => void;
+}
+
+type HandleDir = "nw" | "n" | "ne" | "e" | "se" | "s" | "sw" | "w" | "start" | "end";
+
+function hexToRgba(hex: string, alpha: number): string {
+  const clean = (hex || "#000000").trim().replace(/^#/, "");
+  if (clean.length === 6) {
+    const r = parseInt(clean.slice(0, 2), 16);
+    const g = parseInt(clean.slice(2, 4), 16);
+    const b = parseInt(clean.slice(4, 6), 16);
+    if (!Number.isNaN(r) && !Number.isNaN(g) && !Number.isNaN(b)) {
+      return `rgba(${r}, ${g}, ${b}, ${Math.max(0, Math.min(1, alpha))})`;
+    }
+  }
+  return `rgba(0, 0, 0, ${Math.max(0, Math.min(1, alpha))})`;
+}
+
+export function getFontStack(family?: string): string {
+  const f = (family || "Inter").trim();
+  if (!f || f === "Inter") return `"Inter", "Segoe UI", sans-serif`;
+  const escaped = f.replace(/"/g, "");
+  return `"${escaped}", "Segoe UI", sans-serif`;
+}
+
+export function resolveTextBgStyle(ann: TextAnnotation): TextBgStyle {
+  if (ann.bgStyle) return ann.bgStyle;
+  return ann.hasPill ? "glass" : "none";
 }
 
 interface CameraState {
@@ -137,9 +169,47 @@ function drawBlurRegion(
   const rh = Math.min(sourceImg.naturalHeight - ry, Math.round(ann.height));
   if (rw < 2 || rh < 2) return;
 
-  const factor = Math.max(6, ann.intensity || 14);
-  const tinyW = Math.max(2, Math.round(rw / factor));
-  const tinyH = Math.max(2, Math.round(rh / factor));
+  const mode: BlurMode = ann.mode ?? "gaussian";
+  const intensity = Math.max(2, Math.min(48, ann.intensity || 14));
+  const touchesEdge =
+    rx <= 1 ||
+    ry <= 1 ||
+    rx + rw >= sourceImg.naturalWidth - 1 ||
+    ry + rh >= sourceImg.naturalHeight - 1;
+  const radius = touchesEdge ? 0 : Math.max(0, ann.borderRadius ?? 8);
+
+  if (mode === "gaussian") {
+    const blurPx = Math.max(2, Math.round(intensity * 0.9));
+    const pad = Math.min(80, blurPx * 2);
+    const sx = Math.max(0, rx - pad);
+    const sy = Math.max(0, ry - pad);
+    const sx2 = Math.min(sourceImg.naturalWidth, rx + rw + pad);
+    const sy2 = Math.min(sourceImg.naturalHeight, ry + rh + pad);
+    const sw = Math.max(1, sx2 - sx);
+    const sh = Math.max(1, sy2 - sy);
+
+    const off = document.createElement("canvas");
+    off.width = sw;
+    off.height = sh;
+    const octx = off.getContext("2d");
+    if (!octx) return;
+
+    octx.filter = `blur(${blurPx}px)`;
+    octx.drawImage(sourceImg, sx, sy, sw, sh, 0, 0, sw, sh);
+    octx.filter = "none";
+
+    ctx.save();
+    drawRoundedRectPath(ctx, rx, ry, rw, rh, radius);
+    ctx.clip();
+    ctx.drawImage(off, rx - sx, ry - sy, rw, rh, rx, ry, rw, rh);
+    ctx.restore();
+    return;
+  }
+
+  // Pixelate mode (sharp mosaic blocks)
+  const blockSize = Math.max(4, intensity);
+  const tinyW = Math.max(1, Math.round(rw / blockSize));
+  const tinyH = Math.max(1, Math.round(rh / blockSize));
 
   const tiny = document.createElement("canvas");
   tiny.width = tinyW;
@@ -151,25 +221,36 @@ function drawBlurRegion(
   tctx.drawImage(sourceImg, rx, ry, rw, rh, 0, 0, tinyW, tinyH);
 
   ctx.save();
-  const touchesEdge =
-    rx <= 1 ||
-    ry <= 1 ||
-    rx + rw >= sourceImg.naturalWidth - 1 ||
-    ry + rh >= sourceImg.naturalHeight - 1;
-  drawRoundedRectPath(ctx, rx, ry, rw, rh, touchesEdge ? 0 : 6);
+  drawRoundedRectPath(ctx, rx, ry, rw, rh, radius);
   ctx.clip();
-  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingEnabled = false;
   ctx.drawImage(tiny, 0, 0, tinyW, tinyH, rx, ry, rw, rh);
-  ctx.fillStyle = "rgba(15, 23, 42, 0.08)";
-  ctx.fillRect(rx, ry, rw, rh);
+  ctx.imageSmoothingEnabled = true;
   ctx.restore();
 }
 
 function drawTextAnnotation(ctx: CanvasRenderingContext2D, ann: TextAnnotation) {
   const lines = (ann.text || " ").split("\n");
   const lineHeight = ann.fontSize * 1.25;
+  const fontStack = getFontStack(ann.fontFamily);
+  const bgStyle = resolveTextBgStyle(ann);
+  const bgColor = ann.bgColor || "#090D16";
+  const bgColor2 = ann.bgColor2 || "#4F46E5";
+  const bgOpacity = ann.bgOpacity ?? (bgStyle === "glass" ? 0.82 : bgStyle === "highlight" ? 0.48 : 0.96);
+  const padX = ann.paddingX ?? Math.round(Math.max(10, ann.fontSize * 0.42));
+  const padY = ann.paddingY ?? Math.round(Math.max(6, ann.fontSize * 0.25));
+  const offX = ann.textOffsetX ?? 0;
+  const offY = ann.textOffsetY ?? 0;
+  const cornerR = ann.borderRadius ?? (bgStyle === "highlight" ? 6 : 12);
+  const layerOpacity = Math.max(0.05, Math.min(1, ann.opacity ?? 1));
+  const shadowEnabled = ann.shadowEnabled ?? true;
+  const shadowBlur = ann.shadowBlur ?? (bgStyle === "none" ? 6 : 3);
+  const shadowColor = ann.shadowColor || "#000000";
+  const shadowOffsetY = ann.shadowOffsetY ?? 2;
+
   ctx.save();
-  ctx.font = `${ann.bold ? "700" : "500"} ${ann.fontSize}px "Inter", "Segoe UI", sans-serif`;
+  ctx.globalAlpha = layerOpacity;
+  ctx.font = `${ann.italic ? "italic " : ""}${ann.bold ? "700" : "500"} ${ann.fontSize}px ${fontStack}`;
   ctx.textBaseline = "top";
 
   let maxW = 0;
@@ -177,35 +258,67 @@ function drawTextAnnotation(ctx: CanvasRenderingContext2D, ann: TextAnnotation) 
     maxW = Math.max(maxW, ctx.measureText(line).width);
   }
   const totalH = lines.length * lineHeight;
-  const padX = Math.max(10, ann.fontSize * 0.42);
-  const padY = Math.max(6, ann.fontSize * 0.25);
 
-  if (ann.hasPill) {
+  if (bgStyle !== "none") {
     ctx.save();
-    ctx.shadowColor = "rgba(0,0,0,0.45)";
-    ctx.shadowBlur = 12;
-    ctx.fillStyle = "rgba(9, 13, 22, 0.84)";
-    drawRoundedRectPath(
-      ctx,
-      ann.x - padX,
-      ann.y - padY,
-      maxW + padX * 2,
-      totalH + padY * 2,
-      10
-    );
-    ctx.fill();
-    ctx.strokeStyle = "rgba(255,255,255,0.16)";
-    ctx.lineWidth = 1.5;
-    ctx.stroke();
+    const boxX = ann.x - padX;
+    const boxY = ann.y - padY;
+    const boxW = maxW + padX * 2;
+    const boxH = totalH + padY * 2;
+
+    drawRoundedRectPath(ctx, boxX, boxY, boxW, boxH, cornerR);
+
+    if (bgStyle === "glass") {
+      ctx.shadowColor = "rgba(0,0,0,0.42)";
+      ctx.shadowBlur = 12;
+      ctx.fillStyle = hexToRgba(bgColor, bgOpacity);
+      ctx.fill();
+      ctx.shadowBlur = 0;
+      ctx.strokeStyle = "rgba(255,255,255,0.22)";
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
+    } else if (bgStyle === "solid") {
+      ctx.shadowColor = "rgba(0,0,0,0.36)";
+      ctx.shadowBlur = 10;
+      ctx.fillStyle = hexToRgba(bgColor, bgOpacity);
+      ctx.fill();
+    } else if (bgStyle === "gradient") {
+      ctx.shadowColor = "rgba(0,0,0,0.4)";
+      ctx.shadowBlur = 14;
+      const grad = ctx.createLinearGradient(boxX, boxY, boxX + boxW, boxY + boxH);
+      grad.addColorStop(0, hexToRgba(bgColor, bgOpacity));
+      grad.addColorStop(1, hexToRgba(bgColor2, bgOpacity));
+      ctx.fillStyle = grad;
+      ctx.fill();
+      ctx.shadowBlur = 0;
+      ctx.strokeStyle = "rgba(255,255,255,0.18)";
+      ctx.lineWidth = 1;
+      ctx.stroke();
+    } else if (bgStyle === "outline") {
+      ctx.fillStyle = hexToRgba(bgColor, bgOpacity * 0.3);
+      ctx.fill();
+      ctx.strokeStyle = ann.color;
+      ctx.lineWidth = Math.max(2, ann.fontSize * 0.08);
+      ctx.stroke();
+    } else if (bgStyle === "highlight") {
+      ctx.fillStyle = hexToRgba(bgColor, bgOpacity * 0.65);
+      ctx.fill();
+    }
     ctx.restore();
   }
 
-  ctx.shadowColor = "rgba(0,0,0,0.65)";
-  ctx.shadowBlur = ann.hasPill ? 2 : 6;
+  if (shadowEnabled && shadowBlur > 0) {
+    ctx.shadowColor = hexToRgba(shadowColor, 0.72);
+    ctx.shadowBlur = shadowBlur;
+    ctx.shadowOffsetY = shadowOffsetY;
+  } else {
+    ctx.shadowColor = "transparent";
+    ctx.shadowBlur = 0;
+  }
   ctx.fillStyle = ann.color;
 
   lines.forEach((line, idx) => {
-    ctx.fillText(line, ann.x, ann.y + idx * lineHeight);
+    ctx.fillText(line, ann.x + offX, ann.y + offY + idx * lineHeight);
   });
 
   ctx.restore();
@@ -217,6 +330,7 @@ export function drawAnnotationsOnCanvas(
   annotations: Annotation[]
 ) {
   for (const ann of annotations) {
+    if (ann.visible === false) continue;
     if (ann.kind === "blur") {
       drawBlurRegion(ctx, sourceImg, ann);
     } else if (ann.kind === "rect") {
@@ -276,16 +390,18 @@ export async function renderCompositeDataUrl(
 
 export async function renderBaseWithBlursDataUrl(
   baseImageUrl: string,
-  annotations: Annotation[]
+  annotations: Annotation[],
+  cropRect?: CropRect | null
 ): Promise<string> {
   const blurs = annotations.filter((a) => a.kind === "blur");
-  return renderCompositeDataUrl(baseImageUrl, blurs);
+  return renderCompositeDataUrl(baseImageUrl, blurs, cropRect);
 }
 
 export async function renderVectorsOntoUpscaledDataUrl(
   upscaledImageUrl: string,
   annotations: Annotation[],
-  scale: number
+  scale: number,
+  cropRect?: CropRect | null
 ): Promise<string> {
   const img = await loadImage(upscaledImageUrl);
   const canvas = document.createElement("canvas");
@@ -297,8 +413,11 @@ export async function renderVectorsOntoUpscaledDataUrl(
   ctx.drawImage(img, 0, 0);
   const vectors = annotations.filter((a) => a.kind !== "blur");
   if (vectors.length > 0) {
+    const ox = cropRect ? Math.max(0, Math.round(cropRect.x)) : 0;
+    const oy = cropRect ? Math.max(0, Math.round(cropRect.y)) : 0;
     ctx.save();
     ctx.scale(scale, scale);
+    ctx.translate(-ox, -oy);
     drawAnnotationsOnCanvas(ctx, img, vectors);
     ctx.restore();
   }
@@ -324,17 +443,19 @@ function getAnnotationBounds(
   const lineH = ann.fontSize * 1.25;
   let maxW = 80;
   if (measureCtx) {
-    measureCtx.font = `${ann.bold ? "700" : "500"} ${ann.fontSize}px "Inter", "Segoe UI", sans-serif`;
+    measureCtx.font = `${ann.italic ? "italic " : ""}${ann.bold ? "700" : "500"} ${ann.fontSize}px ${getFontStack(ann.fontFamily)}`;
     maxW = lines.reduce(
       (acc, l) => Math.max(acc, measureCtx.measureText(l).width),
       20
     );
   }
+  const padX = ann.paddingX ?? Math.round(Math.max(10, ann.fontSize * 0.42));
+  const padY = ann.paddingY ?? Math.round(Math.max(6, ann.fontSize * 0.25));
   return {
-    x: ann.x - 10,
-    y: ann.y - 6,
-    w: maxW + 20,
-    h: lines.length * lineH + 12,
+    x: ann.x - padX,
+    y: ann.y - padY,
+    w: maxW + padX * 2,
+    h: lines.length * lineH + padY * 2,
   };
 }
 
@@ -347,12 +468,14 @@ export default function EditorCanvas({
   selectedId,
   activeColor,
   strokeWidth,
-  fontSize,
-  textBold,
-  textHasPill,
+  textStyle,
+  blurMode,
+  blurIntensity,
+  blurRadius,
   zoom,
   fitNonce = 0,
   cropRect,
+  activeCrop,
   aspectPreset,
   previewResult,
   frameOptions,
@@ -395,17 +518,33 @@ export default function EditorCanvas({
   } | null>(null);
 
   const interactionRef = useRef<{
-    kind: "draw" | "move-ann" | "draw-crop" | "move-crop";
+    kind:
+      | "draw"
+      | "move-ann"
+      | "resize-ann"
+      | "draw-crop"
+      | "move-crop"
+      | "resize-crop";
     startImgX: number;
     startImgY: number;
     targetId?: string;
     origAnn?: Annotation;
     origCrop?: CropRect;
+    handle?: HandleDir;
     checkpointed?: boolean;
     pointerId?: number;
   } | null>(null);
 
   const showLiveFrame = Boolean(frameOptions?.enabled) && tool !== "crop";
+  const viewCrop = tool === "crop" ? null : activeCrop;
+  const viewOffsetX = viewCrop ? Math.max(0, Math.round(viewCrop.x)) : 0;
+  const viewOffsetY = viewCrop ? Math.max(0, Math.round(viewCrop.y)) : 0;
+  const viewWidth = viewCrop
+    ? Math.max(1, Math.min(imageWidth - viewOffsetX, Math.round(viewCrop.width)))
+    : imageWidth;
+  const viewHeight = viewCrop
+    ? Math.max(1, Math.min(imageHeight - viewOffsetY, Math.round(viewCrop.height)))
+    : imageHeight;
 
   const computeFitCamera = useCallback(
     (w: number, h: number): CameraState => {
@@ -414,22 +553,22 @@ export default function EditorCanvas({
       const availH = Math.max(80, h - 48);
       const fitScale = Math.min(
         1,
-        availW / Math.max(1, imageWidth + pad),
-        availH / Math.max(1, imageHeight + pad)
+        availW / Math.max(1, viewWidth + pad),
+        availH / Math.max(1, viewHeight + pad)
       );
       return {
         scale: fitScale,
-        x: (w - imageWidth * fitScale) * 0.5,
-        y: (h - imageHeight * fitScale) * 0.5,
+        x: (w - viewWidth * fitScale) * 0.5,
+        y: (h - viewHeight * fitScale) * 0.5,
       };
     },
-    [imageWidth, imageHeight, showLiveFrame, frameOptions?.padding]
+    [viewWidth, viewHeight, showLiveFrame, frameOptions?.padding]
   );
 
   const clampCamera = useCallback(
     (scale: number, x: number, y: number, w: number, h: number): CameraState => {
-      const imgW = imageWidth * scale;
-      const imgH = imageHeight * scale;
+      const imgW = viewWidth * scale;
+      const imgH = viewHeight * scale;
       const keepX = Math.min(110, Math.max(36, imgW * 0.35));
       const keepY = Math.min(110, Math.max(36, imgH * 0.35));
       return {
@@ -438,7 +577,7 @@ export default function EditorCanvas({
         y: Math.max(keepY - imgH, Math.min(h - keepY, y)),
       };
     },
-    [imageWidth, imageHeight]
+    [viewWidth, viewHeight]
   );
 
   const startCameraLoop = useCallback(() => {
@@ -674,27 +813,32 @@ export default function EditorCanvas({
     setEditingTextId(null);
   }, [imageDataUrl]);
 
-  // Redraw composite live canvas only when pixels or annotations change (never during zoom/pan!)
+  // Redraw composite live canvas only when pixels, crop or annotations change (never during zoom/pan!)
   useEffect(() => {
     const canvas = canvasRef.current;
     const img = loadedImgRef.current;
     if (!canvas || !img) return;
-    canvas.width = imageWidth;
-    canvas.height = imageHeight;
+    canvas.width = viewWidth;
+    canvas.height = viewHeight;
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
 
-    ctx.clearRect(0, 0, imageWidth, imageHeight);
+    ctx.clearRect(0, 0, viewWidth, viewHeight);
+    ctx.save();
+    ctx.translate(-viewOffsetX, -viewOffsetY);
     ctx.drawImage(img, 0, 0);
     const visibleAnns = editingTextId
       ? annotations.filter((a) => a.id !== editingTextId)
       : annotations;
     const list = draftAnn ? [...visibleAnns, draftAnn] : visibleAnns;
     drawAnnotationsOnCanvas(ctx, img, list);
+    ctx.restore();
   }, [
     imageDataUrl,
-    imageWidth,
-    imageHeight,
+    viewWidth,
+    viewHeight,
+    viewOffsetX,
+    viewOffsetY,
     annotations,
     draftAnn,
     editingTextId,
@@ -705,16 +849,16 @@ export default function EditorCanvas({
   const clientToImg = useCallback(
     (clientX: number, clientY: number) => {
       const canvas = canvasRef.current;
-      if (!canvas) return { x: 0, y: 0 };
+      if (!canvas) return { x: viewOffsetX, y: viewOffsetY };
       const rect = canvas.getBoundingClientRect();
-      const x = ((clientX - rect.left) / Math.max(1, rect.width)) * imageWidth;
-      const y = ((clientY - rect.top) / Math.max(1, rect.height)) * imageHeight;
+      const localX = ((clientX - rect.left) / Math.max(1, rect.width)) * viewWidth;
+      const localY = ((clientY - rect.top) / Math.max(1, rect.height)) * viewHeight;
       return {
-        x: Math.max(0, Math.min(imageWidth, x)),
-        y: Math.max(0, Math.min(imageHeight, y)),
+        x: Math.max(0, Math.min(imageWidth, viewOffsetX + localX)),
+        y: Math.max(0, Math.min(imageHeight, viewOffsetY + localY)),
       };
     },
-    [imageWidth, imageHeight]
+    [imageWidth, imageHeight, viewOffsetX, viewOffsetY, viewWidth, viewHeight]
   );
 
   const applyAspectToDrag = useCallback(
@@ -771,10 +915,57 @@ export default function EditorCanvas({
     []
   );
 
+  const startCropHandleDrag = useCallback(
+    (handle: HandleDir, e: React.PointerEvent) => {
+      if (!cropRect) return;
+      e.preventDefault();
+      e.stopPropagation();
+      const pt = clientToImg(e.clientX, e.clientY);
+      interactionRef.current = {
+        kind: "resize-crop",
+        startImgX: pt.x,
+        startImgY: pt.y,
+        origCrop: { ...cropRect },
+        handle,
+        pointerId: e.pointerId,
+      };
+      try {
+        viewportRef.current?.setPointerCapture(e.pointerId);
+      } catch {
+        // Ignore
+      }
+    },
+    [cropRect, clientToImg]
+  );
+
+  const startAnnHandleDrag = useCallback(
+    (ann: Annotation, handle: HandleDir, e: React.PointerEvent) => {
+      e.preventDefault();
+      e.stopPropagation();
+      const pt = clientToImg(e.clientX, e.clientY);
+      interactionRef.current = {
+        kind: "resize-ann",
+        startImgX: pt.x,
+        startImgY: pt.y,
+        targetId: ann.id,
+        origAnn: { ...ann },
+        handle,
+        pointerId: e.pointerId,
+      };
+      try {
+        viewportRef.current?.setPointerCapture(e.pointerId);
+      } catch {
+        // Ignore
+      }
+    },
+    [clientToImg]
+  );
+
   const handleViewportPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
     if ((e.target as HTMLElement).closest("[data-zoom-hud]")) return;
     if ((e.target as HTMLElement).closest("[data-split-handle]")) return;
     if ((e.target as HTMLElement).closest("[data-inline-editor]")) return;
+    if ((e.target as HTMLElement).closest("[data-resize-handle]")) return;
 
     // Middle-click or Spacebar always pans from any mode/tool
     if (e.button === 1 || (e.button === 0 && spacePressed)) {
@@ -857,13 +1048,30 @@ export default function EditorCanvas({
       const newText: TextAnnotation = {
         id,
         kind: "text",
+        visible: true,
         x: pt.x,
         y: pt.y,
         text: "Texto",
-        fontSize,
-        color: activeColor,
-        bold: textBold,
-        hasPill: textHasPill,
+        fontSize: textStyle.fontSize,
+        fontFamily: textStyle.fontFamily,
+        color: textStyle.color,
+        bold: textStyle.bold,
+        italic: textStyle.italic,
+        hasPill: textStyle.bgStyle !== "none",
+        bgStyle: textStyle.bgStyle,
+        bgColor: textStyle.bgColor,
+        bgColor2: textStyle.bgColor2,
+        bgOpacity: textStyle.bgOpacity,
+        paddingX: textStyle.paddingX,
+        paddingY: textStyle.paddingY,
+        textOffsetX: textStyle.textOffsetX,
+        textOffsetY: textStyle.textOffsetY,
+        borderRadius: textStyle.borderRadius,
+        opacity: textStyle.opacity,
+        shadowEnabled: textStyle.shadowEnabled,
+        shadowBlur: textStyle.shadowBlur,
+        shadowColor: textStyle.shadowColor,
+        shadowOffsetY: textStyle.shadowOffsetY,
       };
       onAddAnnotation(newText);
       onSelectId(id);
@@ -874,6 +1082,7 @@ export default function EditorCanvas({
     if (tool === "select") {
       const ctx = canvasRef.current?.getContext("2d") ?? null;
       const hit = [...annotations].reverse().find((ann) => {
+        if (ann.visible === false) return false;
         const b = getAnnotationBounds(ann, ctx);
         return (
           pt.x >= b.x && pt.x <= b.x + b.w && pt.y >= b.y && pt.y <= b.y + b.h
@@ -905,6 +1114,7 @@ export default function EditorCanvas({
       setDraftAnn({
         id,
         kind: "rect",
+        visible: true,
         x: pt.x,
         y: pt.y,
         width: 0,
@@ -916,16 +1126,20 @@ export default function EditorCanvas({
       setDraftAnn({
         id,
         kind: "blur",
+        visible: true,
         x: pt.x,
         y: pt.y,
         width: 0,
         height: 0,
-        intensity: 14,
+        mode: blurMode,
+        intensity: blurIntensity,
+        borderRadius: blurRadius,
       });
     } else if (tool === "arrow") {
       setDraftAnn({
         id,
         kind: "arrow",
+        visible: true,
         x1: pt.x,
         y1: pt.y,
         x2: pt.x,
@@ -994,6 +1208,145 @@ export default function EditorCanvas({
         Math.min(imageHeight - inter.origCrop.height, inter.origCrop.y + dy)
       );
       onChangeCropRect({ ...inter.origCrop, x: nx, y: ny });
+      return;
+    }
+
+    if (inter.kind === "resize-crop" && inter.origCrop && inter.handle) {
+      const o = inter.origCrop;
+      const h = inter.handle;
+      const minSize = 12;
+      let left = o.x;
+      let top = o.y;
+      let right = o.x + o.width;
+      let bottom = o.y + o.height;
+
+      if (h.includes("w")) left = Math.max(0, Math.min(right - minSize, pt.x));
+      if (h.includes("e")) right = Math.min(imageWidth, Math.max(left + minSize, pt.x));
+      if (h.includes("n")) top = Math.max(0, Math.min(bottom - minSize, pt.y));
+      if (h.includes("s")) bottom = Math.min(imageHeight, Math.max(top + minSize, pt.y));
+
+      const ratio =
+        aspectPreset === "16:9"
+          ? 16 / 9
+          : aspectPreset === "4:3"
+            ? 4 / 3
+            : aspectPreset === "1:1"
+              ? 1
+              : null;
+
+      if (ratio) {
+        let w = right - left;
+        let ch = bottom - top;
+        if (h === "n" || h === "s") {
+          w = ch * ratio;
+          const cx = (left + right) * 0.5;
+          left = Math.max(0, cx - w * 0.5);
+          right = Math.min(imageWidth, left + w);
+          w = right - left;
+          ch = w / ratio;
+          if (h === "n") top = Math.max(0, bottom - ch);
+          else bottom = Math.min(imageHeight, top + ch);
+        } else if (h === "e" || h === "w") {
+          ch = w / ratio;
+          const cy = (top + bottom) * 0.5;
+          top = Math.max(0, cy - ch * 0.5);
+          bottom = Math.min(imageHeight, top + ch);
+          ch = bottom - top;
+          w = ch * ratio;
+          if (h === "w") left = Math.max(0, right - w);
+          else right = Math.min(imageWidth, left + w);
+        } else {
+          // Corner handle: match dominant axis while clamping inside bounds
+          if (w / ratio >= ch) {
+            ch = w / ratio;
+          } else {
+            w = ch * ratio;
+          }
+          if (h.includes("w")) left = right - w;
+          else right = left + w;
+          if (h.includes("n")) top = bottom - ch;
+          else bottom = top + ch;
+
+          if (left < 0) {
+            left = 0;
+            w = right;
+            ch = w / ratio;
+            if (h.includes("n")) top = bottom - ch;
+            else bottom = top + ch;
+          }
+          if (right > imageWidth) {
+            right = imageWidth;
+            w = right - left;
+            ch = w / ratio;
+            if (h.includes("n")) top = bottom - ch;
+            else bottom = top + ch;
+          }
+          if (top < 0) {
+            top = 0;
+            ch = bottom;
+            w = ch * ratio;
+            if (h.includes("w")) left = right - w;
+            else right = left + w;
+          }
+          if (bottom > imageHeight) {
+            bottom = imageHeight;
+            ch = bottom - top;
+            w = ch * ratio;
+            if (h.includes("w")) left = right - w;
+            else right = left + w;
+          }
+        }
+      }
+
+      onChangeCropRect({
+        x: Math.max(0, left),
+        y: Math.max(0, top),
+        width: Math.max(minSize, right - left),
+        height: Math.max(minSize, bottom - top),
+      });
+      return;
+    }
+
+    if (inter.kind === "resize-ann" && inter.targetId && inter.origAnn && inter.handle) {
+      if (!inter.checkpointed) {
+        onCheckpointHistory?.();
+        inter.checkpointed = true;
+      }
+      const orig = inter.origAnn;
+      const h = inter.handle;
+
+      if (orig.kind === "arrow") {
+        if (h === "start") {
+          onUpdateAnnotation(inter.targetId, { x1: pt.x, y1: pt.y }, false);
+        } else {
+          onUpdateAnnotation(inter.targetId, { x2: pt.x, y2: pt.y }, false);
+        }
+        return;
+      }
+
+      if (orig.kind === "rect" || orig.kind === "blur") {
+        const minSize = 10;
+        let left = orig.x;
+        let top = orig.y;
+        let right = orig.x + orig.width;
+        let bottom = orig.y + orig.height;
+
+        if (h.includes("w")) left = Math.max(0, Math.min(right - minSize, pt.x));
+        if (h.includes("e")) right = Math.min(imageWidth, Math.max(left + minSize, pt.x));
+        if (h.includes("n")) top = Math.max(0, Math.min(bottom - minSize, pt.y));
+        if (h.includes("s")) bottom = Math.min(imageHeight, Math.max(top + minSize, pt.y));
+
+        onUpdateAnnotation(
+          inter.targetId,
+          {
+            x: left,
+            y: top,
+            width: Math.max(minSize, right - left),
+            height: Math.max(minSize, bottom - top),
+          },
+          false
+        );
+      }
       return;
     }
 
@@ -1110,22 +1463,128 @@ export default function EditorCanvas({
     ) ?? null;
 
   const displayScale = cam.scale;
-  const displayW = Math.max(1, Math.round(imageWidth * displayScale));
-  const displayH = Math.max(1, Math.round(imageHeight * displayScale));
+  const displayW = Math.max(1, Math.round(viewWidth * displayScale));
+  const displayH = Math.max(1, Math.round(viewHeight * displayScale));
 
   const framePadPx = showLiveFrame
-    ? Math.max(8, Math.round((frameOptions?.padding ?? 44) * displayScale))
+    ? Math.max(0, Math.round((frameOptions?.padding ?? 44) * displayScale))
     : 0;
   const frameRadiusPx = showLiveFrame
-    ? Math.max(2, Math.round((frameOptions?.borderRadius ?? 18) * displayScale))
+    ? Math.max(0, Math.round((frameOptions?.borderRadius ?? 18) * displayScale))
     : 12;
-  const frameShadowCss = showLiveFrame
-    ? frameOptions?.shadowStrength === "soft"
-      ? `0 ${Math.round(8 * displayScale)}px ${Math.round(24 * displayScale)}px rgba(0, 0, 0, 0.45)`
-      : frameOptions?.shadowStrength === "strong"
-        ? `0 ${Math.round(18 * displayScale)}px ${Math.round(54 * displayScale)}px rgba(0, 0, 0, 0.86)`
-        : `0 ${Math.round(12 * displayScale)}px ${Math.round(36 * displayScale)}px rgba(0, 0, 0, 0.68)`
-    : undefined;
+
+  const frameShadowCss = useMemo(() => {
+    if (!showLiveFrame || frameOptions?.shadowStrength === "none") return "none";
+    const sHex = frameOptions?.shadowColor || "#000000";
+    if (frameOptions?.shadowStrength === "custom") {
+      const ox = Math.round((frameOptions.shadowOffsetX ?? 0) * displayScale);
+      const oy = Math.round((frameOptions.shadowOffsetY ?? 12) * displayScale);
+      const bl = Math.round((frameOptions.shadowBlur ?? 24) * displayScale);
+      const sp = Math.round((frameOptions.shadowSpread ?? 0) * displayScale);
+      const op = frameOptions.shadowOpacity ?? 0.65;
+      return `${ox}px ${oy}px ${bl}px ${sp}px ${hexToRgba(sHex, op)}`;
+    }
+    if (frameOptions?.shadowStrength === "soft") {
+      return `0 ${Math.round(8 * displayScale)}px ${Math.round(24 * displayScale)}px ${hexToRgba(sHex, 0.45)}`;
+    }
+    if (frameOptions?.shadowStrength === "strong") {
+      return `0 ${Math.round(18 * displayScale)}px ${Math.round(54 * displayScale)}px ${hexToRgba(sHex, 0.86)}`;
+    }
+    return `0 ${Math.round(12 * displayScale)}px ${Math.round(36 * displayScale)}px ${hexToRgba(sHex, 0.68)}`;
+  }, [
+    showLiveFrame,
+    frameOptions?.shadowStrength,
+    frameOptions?.shadowColor,
+    frameOptions?.shadowOffsetX,
+    frameOptions?.shadowOffsetY,
+    frameOptions?.shadowBlur,
+    frameOptions?.shadowSpread,
+    frameOptions?.shadowOpacity,
+    displayScale,
+  ]);
+
+  const frameBorderOverlayStyle = useMemo<React.CSSProperties | null>(() => {
+    if (!showLiveFrame || !frameOptions?.subtleBorder) return null;
+    const bw = Math.max(0, (frameOptions.borderWidth ?? 1.5) * displayScale);
+    const op = frameOptions.borderOpacity ?? 0.24;
+    if (bw <= 0.05 || op <= 0.005) return null;
+    const col = hexToRgba(frameOptions.borderColor || "#FFFFFF", op);
+    const pos = frameOptions.borderPosition || "inside";
+
+    if (pos === "outside") {
+      return {
+        inset: -bw,
+        border: `${bw}px solid ${col}`,
+        borderRadius: frameRadiusPx + bw,
+      };
+    }
+    if (pos === "center") {
+      const half = bw * 0.5;
+      return {
+        inset: -half,
+        border: `${bw}px solid ${col}`,
+        borderRadius: frameRadiusPx + half,
+      };
+    }
+    // inside
+    return {
+      inset: 0,
+      boxShadow: `inset 0 0 0 ${bw}px ${col}`,
+      borderRadius: frameRadiusPx,
+    };
+  }, [
+    showLiveFrame,
+    frameOptions?.subtleBorder,
+    frameOptions?.borderWidth,
+    frameOptions?.borderColor,
+    frameOptions?.borderOpacity,
+    frameOptions?.borderPosition,
+    frameRadiusPx,
+    displayScale,
+  ]);
+
+  const handleViewportDoubleClick = useCallback(
+    (e: React.MouseEvent<HTMLDivElement>) => {
+      const target = e.target as HTMLElement;
+      if (target.closest("[data-zoom-hud]")) return;
+      if (target.closest("[data-split-handle]")) return;
+      if (target.closest("[data-inline-editor]")) return;
+      if (target.closest("[data-resize-handle]")) return;
+
+      if (!previewResult && tool !== "crop" && target.closest("[data-canvas-stage]")) {
+        const pt = clientToImg(e.clientX, e.clientY);
+        const ctx = canvasRef.current?.getContext("2d") ?? null;
+        const hitText = [...annotations].reverse().find((ann) => {
+          if (ann.kind !== "text" || ann.visible === false) return false;
+          const b = getAnnotationBounds(ann, ctx);
+          return (
+            pt.x >= b.x &&
+            pt.x <= b.x + b.w &&
+            pt.y >= b.y &&
+            pt.y <= b.y + b.h
+          );
+        });
+        if (hitText) {
+          onSelectId(hitText.id);
+          setEditingTextId(hitText.id);
+          return;
+        }
+      }
+
+      // Double-click anywhere else on the viewport centers and fits the capture
+      onChangeZoom("fit");
+    },
+    [previewResult, tool, clientToImg, annotations, onSelectId, onChangeZoom]
+  );
+
+  const totalPngW = viewWidth + (frameOptions?.padding ?? 44) * 2;
+  const totalPngH = viewHeight + (frameOptions?.padding ?? 44) * 2;
+
+  // Keep the Before/After comparison handle vertically centered inside the visible viewport
+  const splitHandleTopPx = Math.max(
+    28,
+    Math.min(Math.max(28, displayH - 28), vpSize.h * 0.5 - cam.y)
+  );
 
   const viewportCursor = isPanning
     ? "cursor-grabbing"
@@ -1142,25 +1601,32 @@ export default function EditorCanvas({
       onPointerMove={handleViewportPointerMove}
       onPointerUp={handleViewportPointerUp}
       onPointerCancel={handleViewportPointerUp}
+      onDoubleClick={handleViewportDoubleClick}
       className={`relative flex-1 min-w-0 min-h-0 overflow-hidden checker-bg select-none ${viewportCursor}`}
     >
       {/* Smooth GPU-Translated Stage (cam.x, cam.y always anchor image top-left) */}
       <div
-        className="absolute left-0 top-0 will-change-transform"
+        className={`absolute left-0 top-0 will-change-transform ${
+          showLiveFrame
+            ? "border border-dashed border-cyan-400/50 bg-cyan-400/[0.025] rounded-lg"
+            : ""
+        }`}
         style={{
           transform: `translate3d(${cam.x - framePadPx}px, ${cam.y - framePadPx}px, 0)`,
           padding: framePadPx,
         }}
       >
+        {showLiveFrame && (
+          <div className="pointer-events-none absolute -top-6 left-0 px-2 py-0.5 rounded-md bg-[#090D16]/90 border border-cyan-400/35 text-[10px] font-medium text-cyan-200 whitespace-nowrap shadow-md">
+            PNG · {totalPngW}×{totalPngH} px · Margen {frameOptions?.padding ?? 44}px
+          </div>
+        )}
+
         {previewResult ? (
           /* Interactive Before / After Real-ESRGAN Comparison Viewer */
           <div
             data-canvas-stage
-            className={`relative overflow-hidden select-none ${
-              showLiveFrame
-                ? ""
-                : "rounded-xl shadow-[0_24px_64px_rgba(0,0,0,0.85)] border border-cyan-400/35"
-            }`}
+            className="relative select-none"
             style={{
               width: displayW,
               height: displayH,
@@ -1168,89 +1634,81 @@ export default function EditorCanvas({
                 ? {
                     borderRadius: frameRadiusPx,
                     boxShadow: frameShadowCss,
-                    border: frameOptions?.subtleBorder
-                      ? "1.5px solid rgba(255,255,255,0.22)"
-                      : "none",
                   }
                 : {}),
             }}
           >
-            {/* After (Real-ESRGAN) Base Layer */}
-            <img
-              src={previewResult.imageDataUrl}
-              alt="Upscaled preview"
-              draggable={false}
-              className="w-full h-full object-fill pointer-events-none"
-            />
-
-            {/* Before (Original Canvas) Clipped Left Layer */}
             <div
-              className="absolute inset-0 pointer-events-none overflow-hidden"
-              style={{ clipPath: `inset(0 ${100 - splitPct}% 0 0)` }}
+              className={`relative w-full h-full overflow-hidden ${
+                showLiveFrame
+                  ? ""
+                  : "rounded-xl shadow-[0_24px_64px_rgba(0,0,0,0.85)] border border-cyan-400/35"
+              }`}
+              style={showLiveFrame ? { borderRadius: frameRadiusPx } : undefined}
             >
-              <canvas
-                ref={canvasRef}
-                style={{
-                  width: displayW,
-                  height: displayH,
-                  imageRendering: displayScale >= 2 ? "pixelated" : "auto",
-                }}
-                className="block"
+              {/* After (Real-ESRGAN) Base Layer */}
+              <img
+                src={previewResult.imageDataUrl}
+                alt="Upscaled preview"
+                draggable={false}
+                className="w-full h-full object-fill pointer-events-none"
               />
-            </div>
 
-            {/* Comparison Split Line & Handle */}
-            <div
-              data-split-handle
-              className="absolute top-0 bottom-0 w-0.5 bg-cyan-300 shadow-[0_0_16px_rgba(34,211,238,0.9)] cursor-ew-resize z-10"
-              style={{ left: `${splitPct}%` }}
-              onPointerDown={(e) => {
-                e.stopPropagation();
-                setDraggingSplit(true);
-              }}
-            >
-              <div className="absolute top-1/2 -translate-y-1/2 -translate-x-1/2 w-8 h-8 rounded-full bg-[#090D16] border-2 border-cyan-300 flex items-center justify-center text-[10px] font-bold text-cyan-200 shadow-xl">
-                ↔
+              {/* Before (Original Canvas) Clipped Left Layer */}
+              <div
+                className="absolute inset-0 pointer-events-none overflow-hidden"
+                style={{ clipPath: `inset(0 ${100 - splitPct}% 0 0)` }}
+              >
+                <canvas
+                  ref={canvasRef}
+                  style={{
+                    width: displayW,
+                    height: displayH,
+                    imageRendering: displayScale >= 2 ? "pixelated" : "auto",
+                  }}
+                  className="block"
+                />
+              </div>
+
+              {/* Comparison Split Line & Handle */}
+              <div
+                data-split-handle
+                className="absolute top-0 bottom-0 w-0.5 bg-cyan-300 shadow-[0_0_16px_rgba(34,211,238,0.9)] cursor-ew-resize z-10"
+                style={{ left: `${splitPct}%` }}
+                onPointerDown={(e) => {
+                  e.stopPropagation();
+                  setDraggingSplit(true);
+                }}
+              >
+                <div
+                  style={{ top: splitHandleTopPx }}
+                  className="absolute -translate-y-1/2 -translate-x-1/2 w-8 h-8 rounded-full bg-[#090D16]/95 border-2 border-cyan-300 flex items-center justify-center text-[10px] font-bold text-cyan-200 shadow-xl"
+                >
+                  ↔
+                </div>
+              </div>
+
+              <div className="absolute top-3 left-3 px-2.5 py-1 rounded-lg bg-[#090D16]/88 border border-white/15 text-[11px] font-medium text-slate-200 backdrop-blur-md pointer-events-none">
+                Original · {viewWidth} × {viewHeight}
+              </div>
+              <div className="absolute top-3 right-3 px-2.5 py-1 rounded-lg bg-[#090D16]/88 border border-cyan-400/45 text-[11px] font-semibold text-cyan-200 backdrop-blur-md pointer-events-none">
+                {previewResult.engine} · {previewResult.width} ×{" "}
+                {previewResult.height} ({previewResult.elapsedMs} ms)
               </div>
             </div>
 
-            <div className="absolute top-3 left-3 px-2.5 py-1 rounded-lg bg-[#090D16]/88 border border-white/15 text-[11px] font-medium text-slate-200 backdrop-blur-md pointer-events-none">
-              Original · {imageWidth} × {imageHeight}
-            </div>
-            <div className="absolute top-3 right-3 px-2.5 py-1 rounded-lg bg-[#090D16]/88 border border-cyan-400/45 text-[11px] font-semibold text-cyan-200 backdrop-blur-md pointer-events-none">
-              {previewResult.engine} · {previewResult.width} ×{" "}
-              {previewResult.height} ({previewResult.elapsedMs} ms)
-            </div>
+            {frameBorderOverlayStyle && (
+              <div
+                className="pointer-events-none absolute z-20"
+                style={frameBorderOverlayStyle}
+              />
+            )}
           </div>
         ) : (
           /* Active Editing Canvas Stage */
           <div
             data-canvas-stage
-            onDoubleClick={(e) => {
-              const pt = clientToImg(e.clientX, e.clientY);
-              const ctx = canvasRef.current?.getContext("2d") ?? null;
-              const hitText = [...annotations].reverse().find((ann) => {
-                if (ann.kind !== "text") return false;
-                const b = getAnnotationBounds(ann, ctx);
-                return (
-                  pt.x >= b.x &&
-                  pt.x <= b.x + b.w &&
-                  pt.y >= b.y &&
-                  pt.y <= b.y + b.h
-                );
-              });
-              if (hitText) {
-                onSelectId(hitText.id);
-                setEditingTextId(hitText.id);
-              } else if (selectedAnn?.kind === "text") {
-                setEditingTextId(selectedAnn.id);
-              }
-            }}
-            className={`relative overflow-hidden ${
-              showLiveFrame
-                ? ""
-                : "rounded-xl shadow-[0_24px_64px_rgba(0,0,0,0.85)] border border-white/15"
-            }`}
+            className="relative"
             style={{
               width: displayW,
               height: displayH,
@@ -1258,80 +1716,260 @@ export default function EditorCanvas({
                 ? {
                     borderRadius: frameRadiusPx,
                     boxShadow: frameShadowCss,
-                    border: frameOptions?.subtleBorder
-                      ? "1.5px solid rgba(255,255,255,0.22)"
-                      : "none",
                   }
                 : {}),
             }}
           >
-            <canvas
-              ref={canvasRef}
-              style={{ width: displayW, height: displayH }}
-              className="block"
-            />
+            <div
+              className={`relative w-full h-full overflow-hidden ${
+                showLiveFrame
+                  ? ""
+                  : "rounded-xl shadow-[0_24px_64px_rgba(0,0,0,0.85)] border border-white/15"
+              }`}
+              style={showLiveFrame ? { borderRadius: frameRadiusPx } : undefined}
+            >
+              <canvas
+                ref={canvasRef}
+                style={{ width: displayW, height: displayH }}
+                className="block"
+              />
+            </div>
 
-            {/* Selected Annotation Bounding Box */}
-            {selectedBounds && selectedAnn && !editingTextId && tool === "select" && (
+            {frameBorderOverlayStyle && (
               <div
-                className="absolute border border-dashed border-cyan-400 rounded-md pointer-events-none"
-                style={{
-                  left: selectedBounds.x * displayScale,
-                  top: selectedBounds.y * displayScale,
-                  width: Math.max(20, selectedBounds.w * displayScale),
-                  height: Math.max(20, selectedBounds.h * displayScale),
-                }}
-              >
-                <button
-                  onPointerDown={(e) => {
-                    e.stopPropagation();
-                    onDeleteAnnotation(selectedAnn.id);
-                  }}
-                  className="pointer-events-auto absolute -top-3 -right-3 w-6 h-6 rounded-full bg-rose-500 hover:bg-rose-400 text-white flex items-center justify-center shadow-lg cursor-pointer"
-                  title="Eliminar anotación (Supr)"
-                >
-                  <Trash2 className="w-3 h-3" />
-                </button>
-              </div>
-            )}
-
-            {/* Inline Text Editor */}
-            {editingTextAnn && (
-              <textarea
-                ref={textAreaRef}
-                data-inline-editor
-                value={editingTextAnn.text}
-                onPointerDown={(e) => e.stopPropagation()}
-                onMouseDown={(e) => e.stopPropagation()}
-                onClick={(e) => e.stopPropagation()}
-                onChange={(e) =>
-                  onUpdateAnnotation(
-                    editingTextAnn.id,
-                    { text: e.target.value },
-                    false
-                  )
-                }
-                onBlur={() => commitEditingText(editingTextAnn.id)}
-                onKeyDown={(e) => {
-                  if (e.key === "Escape" || (e.key === "Enter" && !e.shiftKey)) {
-                    e.preventDefault();
-                    commitEditingText(editingTextAnn.id);
-                  }
-                }}
-                style={{
-                  left: editingTextAnn.x * displayScale,
-                  top: editingTextAnn.y * displayScale,
-                  fontSize: Math.max(12, editingTextAnn.fontSize * displayScale),
-                  color: editingTextAnn.color,
-                  fontWeight: editingTextAnn.bold ? 700 : 500,
-                  userSelect: "text",
-                  WebkitUserSelect: "text",
-                }}
-                className="absolute z-20 min-w-[160px] min-h-[38px] bg-[#090D16]/94 border-2 border-cyan-400 rounded-lg px-2.5 py-1.5 outline-none resize shadow-xl leading-tight select-text"
+                className="pointer-events-none absolute z-10"
+                style={frameBorderOverlayStyle}
               />
             )}
 
-            {/* Crop Overlay Grid */}
+            {/* Selected Annotation Bounding Box + Resize Handles */}
+            {selectedBounds &&
+              selectedAnn &&
+              selectedAnn.visible !== false &&
+              !editingTextId &&
+              tool === "select" && (
+                <>
+                  <div
+                    className="absolute border border-dashed border-cyan-400 rounded-md pointer-events-none z-20"
+                    style={{
+                      left: (selectedBounds.x - viewOffsetX) * displayScale,
+                      top: (selectedBounds.y - viewOffsetY) * displayScale,
+                      width: Math.max(20, selectedBounds.w * displayScale),
+                      height: Math.max(20, selectedBounds.h * displayScale),
+                    }}
+                  >
+                    <button
+                      data-resize-handle
+                      onPointerDown={(e) => {
+                        e.stopPropagation();
+                        onDeleteAnnotation(selectedAnn.id);
+                      }}
+                      className="pointer-events-auto absolute -top-3 -right-3 w-6 h-6 rounded-full bg-rose-500 hover:bg-rose-400 text-white flex items-center justify-center shadow-lg cursor-pointer z-20"
+                      title="Eliminar capa (Supr)"
+                    >
+                      <Trash2 className="w-3 h-3" />
+                    </button>
+
+                    {(selectedAnn.kind === "rect" ||
+                      selectedAnn.kind === "blur") &&
+                      (
+                        [
+                          { dir: "nw", cls: "-top-1.5 -left-1.5 cursor-nwse-resize" },
+                          { dir: "ne", cls: "-top-1.5 -right-1.5 cursor-nesw-resize" },
+                          { dir: "sw", cls: "-bottom-1.5 -left-1.5 cursor-nesw-resize" },
+                          { dir: "se", cls: "-bottom-1.5 -right-1.5 cursor-nwse-resize" },
+                        ] as const
+                      ).map((h) => (
+                        <div
+                          key={h.dir}
+                          data-resize-handle
+                          onPointerDown={(e) =>
+                            startAnnHandleDrag(selectedAnn, h.dir, e)
+                          }
+                          className={`pointer-events-auto absolute w-3 h-3 rounded-sm bg-cyan-300 border border-slate-950 shadow-md z-10 ${h.cls}`}
+                        />
+                      ))}
+                  </div>
+
+                  {selectedAnn.kind === "arrow" && (
+                    <>
+                      <div
+                        data-resize-handle
+                        onPointerDown={(e) =>
+                          startAnnHandleDrag(selectedAnn, "start", e)
+                        }
+                        style={{
+                          left: (selectedAnn.x1 - viewOffsetX) * displayScale,
+                          top: (selectedAnn.y1 - viewOffsetY) * displayScale,
+                        }}
+                        className="pointer-events-auto absolute -translate-x-1/2 -translate-y-1/2 w-3.5 h-3.5 rounded-full bg-cyan-300 border-2 border-slate-950 shadow-md cursor-move z-20"
+                        title="Mover origen de flecha"
+                      />
+                      <div
+                        data-resize-handle
+                        onPointerDown={(e) =>
+                          startAnnHandleDrag(selectedAnn, "end", e)
+                        }
+                        style={{
+                          left: (selectedAnn.x2 - viewOffsetX) * displayScale,
+                          top: (selectedAnn.y2 - viewOffsetY) * displayScale,
+                        }}
+                        className="pointer-events-auto absolute -translate-x-1/2 -translate-y-1/2 w-3.5 h-3.5 rounded-full bg-cyan-300 border-2 border-slate-950 shadow-md cursor-move z-20"
+                        title="Mover punta de flecha"
+                      />
+                    </>
+                  )}
+                </>
+              )}
+
+            {/* WYSIWYG Live Inline Text Editor */}
+            {editingTextAnn &&
+              (() => {
+                const bgStyle = resolveTextBgStyle(editingTextAnn);
+                const bgColor = editingTextAnn.bgColor || "#090D16";
+                const bgColor2 = editingTextAnn.bgColor2 || "#4F46E5";
+                const bgOpacity =
+                  editingTextAnn.bgOpacity ??
+                  (bgStyle === "glass" ? 0.82 : bgStyle === "highlight" ? 0.48 : 0.96);
+                const padX =
+                  (editingTextAnn.paddingX ??
+                    Math.round(Math.max(10, editingTextAnn.fontSize * 0.42))) *
+                  displayScale;
+                const padY =
+                  (editingTextAnn.paddingY ??
+                    Math.round(Math.max(6, editingTextAnn.fontSize * 0.25))) *
+                  displayScale;
+                const offX = (editingTextAnn.textOffsetX ?? 0) * displayScale;
+                const offY = (editingTextAnn.textOffsetY ?? 0) * displayScale;
+                const cornerR =
+                  (editingTextAnn.borderRadius ??
+                    (bgStyle === "highlight" ? 6 : 12)) * displayScale;
+                const scaledFont = Math.max(
+                  10,
+                  editingTextAnn.fontSize * displayScale
+                );
+                const lines = (editingTextAnn.text || " ").split("\n");
+                const ctx = canvasRef.current?.getContext("2d") ?? null;
+                let measuredW = 60;
+                if (ctx) {
+                  ctx.font = `${editingTextAnn.italic ? "italic " : ""}${editingTextAnn.bold ? "700" : "500"} ${editingTextAnn.fontSize}px ${getFontStack(editingTextAnn.fontFamily)}`;
+                  measuredW = lines.reduce(
+                    (acc, l) => Math.max(acc, ctx.measureText(l || " ").width),
+                    40
+                  );
+                }
+                const boxW = Math.max(
+                  80,
+                  measuredW * displayScale + padX * 2 + 16
+                );
+                const lineH = scaledFont * 1.25;
+                const boxH = Math.max(
+                  lineH + padY * 2,
+                  lines.length * lineH + padY * 2 + 2
+                );
+
+                const bgCss: React.CSSProperties =
+                  bgStyle === "glass"
+                    ? {
+                        backgroundColor: hexToRgba(bgColor, bgOpacity),
+                        border: "1.5px solid rgba(255,255,255,0.22)",
+                        borderRadius: cornerR,
+                        boxShadow: "0 4px 18px rgba(0,0,0,0.42)",
+                      }
+                    : bgStyle === "solid"
+                      ? {
+                          backgroundColor: hexToRgba(bgColor, bgOpacity),
+                          border: "1px solid transparent",
+                          borderRadius: cornerR,
+                          boxShadow: "0 4px 16px rgba(0,0,0,0.38)",
+                        }
+                      : bgStyle === "gradient"
+                        ? {
+                            backgroundImage: `linear-gradient(135deg, ${hexToRgba(bgColor, bgOpacity)}, ${hexToRgba(bgColor2, bgOpacity)})`,
+                            border: "1px solid rgba(255,255,255,0.18)",
+                            borderRadius: cornerR,
+                            boxShadow: "0 4px 18px rgba(0,0,0,0.4)",
+                          }
+                        : bgStyle === "outline"
+                          ? {
+                              backgroundColor: hexToRgba(bgColor, bgOpacity * 0.3),
+                              border: `${Math.max(1.5, editingTextAnn.fontSize * 0.08 * displayScale)}px solid ${editingTextAnn.color}`,
+                              borderRadius: cornerR,
+                            }
+                          : bgStyle === "highlight"
+                            ? {
+                                backgroundColor: hexToRgba(bgColor, bgOpacity * 0.65),
+                                border: "1px solid transparent",
+                                borderRadius: cornerR,
+                              }
+                            : {
+                                backgroundColor: "transparent",
+                                border: "1px solid transparent",
+                              };
+
+                const shadowCss =
+                  (editingTextAnn.shadowEnabled ?? true) &&
+                  (editingTextAnn.shadowBlur ?? 4) > 0
+                    ? `0 ${(editingTextAnn.shadowOffsetY ?? 2) * displayScale}px ${(editingTextAnn.shadowBlur ?? 4) * displayScale}px ${hexToRgba(editingTextAnn.shadowColor || "#000000", 0.72)}`
+                    : "none";
+
+                return (
+                  <textarea
+                    ref={textAreaRef}
+                    data-inline-editor
+                    value={editingTextAnn.text}
+                    onPointerDown={(e) => e.stopPropagation()}
+                    onMouseDown={(e) => e.stopPropagation()}
+                    onClick={(e) => e.stopPropagation()}
+                    onChange={(e) =>
+                      onUpdateAnnotation(
+                        editingTextAnn.id,
+                        { text: e.target.value },
+                        false
+                      )
+                    }
+                    onBlur={() => commitEditingText(editingTextAnn.id)}
+                    onKeyDown={(e) => {
+                      if (
+                        e.key === "Escape" ||
+                        (e.key === "Enter" && !e.shiftKey)
+                      ) {
+                        e.preventDefault();
+                        commitEditingText(editingTextAnn.id);
+                      }
+                    }}
+                    spellCheck={false}
+                    style={{
+                      left:
+                        (editingTextAnn.x - viewOffsetX) * displayScale - padX,
+                      top:
+                        (editingTextAnn.y - viewOffsetY) * displayScale - padY,
+                      width: boxW,
+                      height: boxH,
+                      paddingLeft: Math.max(0, padX + offX),
+                      paddingRight: Math.max(0, padX - offX),
+                      paddingTop: Math.max(0, padY + offY),
+                      paddingBottom: Math.max(0, padY - offY),
+                      fontSize: scaledFont,
+                      lineHeight: 1.25,
+                      fontFamily: getFontStack(editingTextAnn.fontFamily),
+                      color: editingTextAnn.color,
+                      fontWeight: editingTextAnn.bold ? 700 : 500,
+                      fontStyle: editingTextAnn.italic ? "italic" : "normal",
+                      opacity: editingTextAnn.opacity ?? 1,
+                      textShadow: shadowCss,
+                      outline: "1.5px dashed rgba(34, 211, 238, 0.65)",
+                      outlineOffset: 3,
+                      userSelect: "text",
+                      WebkitUserSelect: "text",
+                      ...bgCss,
+                    }}
+                    className="absolute z-30 overflow-hidden resize-none whitespace-pre select-text"
+                  />
+                );
+              })()}
+
+            {/* Crop Overlay Grid + 8 Interactive Corner/Edge Handles */}
             {tool === "crop" && cropRect && cropRect.width > 4 && cropRect.height > 4 && (
               <>
                 <div
@@ -1375,6 +2013,40 @@ export default function EditorCanvas({
                   <div className="absolute left-2 top-2 px-2 py-0.5 rounded bg-[#090D16]/85 text-[10px] font-semibold text-emerald-300 border border-emerald-400/40">
                     {Math.round(cropRect.width)} × {Math.round(cropRect.height)} px
                   </div>
+
+                  {/* 4 Corner Handles */}
+                  {(
+                    [
+                      { dir: "nw", cls: "-top-2 -left-2 cursor-nwse-resize" },
+                      { dir: "ne", cls: "-top-2 -right-2 cursor-nesw-resize" },
+                      { dir: "sw", cls: "-bottom-2 -left-2 cursor-nesw-resize" },
+                      { dir: "se", cls: "-bottom-2 -right-2 cursor-nwse-resize" },
+                    ] as const
+                  ).map((h) => (
+                    <div
+                      key={h.dir}
+                      data-resize-handle
+                      onPointerDown={(e) => startCropHandleDrag(h.dir, e)}
+                      className={`pointer-events-auto absolute w-4 h-4 rounded-full bg-emerald-300 border-2 border-slate-950 shadow-[0_0_10px_rgba(52,211,153,0.75)] hover:scale-125 transition-transform z-20 ${h.cls}`}
+                    />
+                  ))}
+
+                  {/* 4 Mid-Edge Handles */}
+                  {(
+                    [
+                      { dir: "n", cls: "-top-1.5 left-1/2 -translate-x-1/2 w-6 h-2.5 cursor-ns-resize" },
+                      { dir: "s", cls: "-bottom-1.5 left-1/2 -translate-x-1/2 w-6 h-2.5 cursor-ns-resize" },
+                      { dir: "w", cls: "top-1/2 -left-1.5 -translate-y-1/2 w-2.5 h-6 cursor-ew-resize" },
+                      { dir: "e", cls: "top-1/2 -right-1.5 -translate-y-1/2 w-2.5 h-6 cursor-ew-resize" },
+                    ] as const
+                  ).map((h) => (
+                    <div
+                      key={h.dir}
+                      data-resize-handle
+                      onPointerDown={(e) => startCropHandleDrag(h.dir, e)}
+                      className={`pointer-events-auto absolute rounded-full bg-emerald-300/95 border border-slate-950 shadow-md hover:scale-110 transition-transform z-20 ${h.cls}`}
+                    />
+                  ))}
                 </div>
               </>
             )}
